@@ -118,7 +118,7 @@ print_job_summary() {
     fi
     
     local res_str="${j_cpus} Cores"
-    if [ "$mem_gb" -gt 0 ]; then res_str="${res_str} | ${mem_gb}GB Memory"; fi
+    if [[ "$mem_gb" =~ [1-9] ]]; then res_str="${res_str} | ${mem_gb}GB Memory"; fi
     if [ -n "$gpu_prettified" ]; then res_str="${res_str} | ${ICON_GPU} ${gpu_prettified}"; fi
 
     echo -e "  • ${STYLE_BOLD}Job ID:${STYLE_RESET}    ${CLR_PURPLE}${job_id}${STYLE_RESET}"

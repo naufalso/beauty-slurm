@@ -229,14 +229,14 @@ while IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount 
             gpu_part="${ICON_GPU} ${gpu_prettified}"
         fi
 
-        if [ "$mem_gb" -gt 0 ]; then
+        if [[ "$mem_gb" =~ [1-9] ]]; then
             f_res="${j_cpus}c/${mem_gb}G/${gpu_part}"
         else
             f_res="${j_cpus}c/${gpu_part}"
         fi
     else
         mem_gb=$(parse_memory_to_gb "$j_mem")
-        if [ "$mem_gb" -gt 0 ]; then
+        if [[ "$mem_gb" =~ [1-9] ]]; then
             f_res="${j_cpus}c/${mem_gb}G"
         else
             f_res="${j_cpus}c"
