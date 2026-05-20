@@ -52,7 +52,7 @@ Get up and running in under a minute!
 ### 1. Clone the Repository
 Clone this repository to your cluster home directory:
 ```bash
-git clone https://github.com/<your-username>/beauty-slurm.git ~/beauty-slurm
+git clone https://github.com/naufalso/beauty-slurm.git ~/beauty-slurm
 cd ~/beauty-slurm
 ```
 
