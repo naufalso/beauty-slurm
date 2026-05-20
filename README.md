@@ -11,7 +11,7 @@ Beauty SLURM transforms cryptic, truncated, and monochrome text outputs into hig
 ### 1. `sjobs` (Smart Job Monitor) — *Wraps `squeue`*
 *   **Visual Progress Mapping**: Displays visual indicators for job elapsed runtime relative to partition limits.
 *   **Pending Reasons Translated**: Cryptic reasons like `ReqNodeNotAvail`, `Priority`, or `Dependency` are translated instantly into helpful human-readable advice (e.g., `🕒 Queued behind higher-priority jobs`, `⚡ Waiting for free resources`).
-*   **GPU Request Highlights**: Spots requested GPU resources (e.g., `16c/64G/⚡ 4x A100`) showing both CPU, Memory, and GPU resource allocations in active orange color at a single glance.
+*   **GPU Request Highlights**: Spots requested GPU resources (e.g., `8n/256c/15G/⚡4g`) showing CPU, Memory, GPU, and node allocations in active orange color at a single glance.
 *   **No Truncation**: Intelligently pads and truncates long job names and usernames to maintain pristine column alignments.
 *   **Wide View (`-w` / `--wide`)**: Extends display to expose precise job submission and start times.
 

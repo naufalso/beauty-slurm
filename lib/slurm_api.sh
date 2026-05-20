@@ -22,6 +22,13 @@ parse_gres() {
         return
     fi
 
+    # Replace = with : for consistent parsing (e.g. gpu=4 -> gpu:4)
+    gres="${gres//=/:}"
+
+    # Strip prefixes like "gres:" or "gres/" if present
+    gres="${gres#gres:}"
+    gres="${gres#gres/}"
+
     # Format 1: gpu:model:count(extra) or gpu:model:count
     if [[ "$gres" =~ gpu:([a-zA-Z0-9_-]+):([0-9]+) ]]; then
         local model="${BASH_REMATCH[1]}"
@@ -43,6 +50,10 @@ parse_gres() {
         local display_model
         display_model=$(echo "$model" | tr '[:lower:]' '[:upper:]' | sed -E 's/TESLA_//g; s/NVIDIA_//g; s/_//g')
         echo "1x $display_model"
+
+    # Format 4: gpu (exact or with parentheses like gpu(S:0))
+    elif [[ "$gres" =~ ^gpu(\(.*\))?$ ]]; then
+        echo "1x GPU"
         
     else
         # Fallback to outputting the original GRES string if it's not a GPU, but cleaned up

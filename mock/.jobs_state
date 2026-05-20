@@ -1,3 +1,5 @@
 106366|gpu|scratch_job|naufalsuryanto|COMPLETED|00:00:13|24:00:00|1|gnode03|4|16G|gpu:v100:1|None|./logs/260520/scratch_job-106366.out|./logs/260520/scratch_job-106366.err
 118432|gpu|run_job|naufalsuryanto|COMPLETED|00:00:13|24:00:00|1|gnode03|4|16G|gpu:v100:1|None|./logs/260520/run_job-118432.out|./logs/260520/run_job-118432.err
 118258|gpu|run_job|naufalsuryanto|COMPLETED|00:00:13|24:00:00|1|gnode03|4|16G|gpu:v100:1|None|./logs/260520/run_job-118258.out|./logs/260520/run_job-118258.err
+120001|gpu|generic_gpu|naufalsuryanto|RUNNING|00:05:00|01:00:00|1|gnode04|32|15.0G|gpu:4|None
+120002|compute|tmpfs_job|naufalsuryanto|RUNNING|00:05:00|01:00:00|1|node05|4|3.8G|gres/tmpfs:10g|None

@@ -39,19 +39,34 @@ if [ -z "$FORMAT_STR" ]; then
     FORMAT_STR="JOBID:%i,PRIORITY:%Y,AGE:%a,FAIRSHARE:%f,PARTITION:%p,QOS:%q,TRES:%t"
 fi
 
+# Detect delimiter
+DELIM=","
+if [[ "$FORMAT_STR" == *"|"* ]]; then
+    DELIM="|"
+fi
+
 # Print header if not suppressed
 if [ "$NO_HEADER" -eq 0 ]; then
     header_line=""
-    IFS=',' read -r -a format_fields <<< "$FORMAT_STR"
+    IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
     for field in "${format_fields[@]}"; do
         title="${field%%:*}"
         if [ "$title" == "$field" ]; then
             title="FIELD"
         fi
-        title=$(echo "$title" | tr '[:lower:]' '[:upper:]')
-        header_line="${header_line}${title}\t"
+        title=$(echo "$title" | tr '[:lower:]' '[:upper:]' | sed -E 's/_//g')
+        if [ "$DELIM" == "|" ]; then
+            header_line="${header_line}${title}|"
+        else
+            header_line="${header_line}${title}\t"
+        fi
     done
-    echo -e "$header_line" | expand -t 15
+    if [ "$DELIM" == "|" ]; then
+        header_line="${header_line%|}"
+        echo -e "$header_line"
+    else
+        echo -e "$header_line" | expand -t 15
+    fi
 fi
 
 # Loop through mock jobs and output priority profiles
@@ -76,9 +91,12 @@ for job_str in "${MOCK_JOBS[@]}"; do
     
     # Format line
     output_line=""
-    IFS=',' read -r -a format_fields <<< "$FORMAT_STR"
+    IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
     for field in "${format_fields[@]}"; do
-        token="${field#*:}"
+        token="$field"
+        if [[ "$field" == *":"* ]]; then
+            token="${field#*:}"
+        fi
         
         val=""
         case "$token" in
@@ -94,7 +112,17 @@ for job_str in "${MOCK_JOBS[@]}"; do
             *) val="0" ;;
         esac
         
-        output_line="${output_line}${val}\t"
+        if [ "$DELIM" == "|" ]; then
+            output_line="${output_line}${val}|"
+        else
+            output_line="${output_line}${val}\t"
+        fi
     done
-    echo -e "$output_line" | expand -t 15
+    if [ "$DELIM" == "|" ]; then
+        output_line="${output_line%|}"
+        echo -e "$output_line"
+    else
+        output_line="${output_line%\\t}"
+        echo -e "$output_line" | expand -t 15
+    fi
 done
