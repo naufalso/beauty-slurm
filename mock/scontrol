@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: Mock scontrol command
+# Simulates scontrol show job and scontrol show node with realistic SLURM configuration printouts.
+
+MOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MOCK_DIR/cluster_state.sh"
+
+action="$1"
+target_type="$2"
+target_id="$3"
+
+if [ "$action" != "show" ]; then
+    echo "Mock scontrol only supports 'show' action." >&2
+    exit 1
+fi
+
+if [ "$target_type" == "job" ]; then
+    # Combine static jobs and dynamic jobs
+    ALL_JOBS=("${MOCK_JOBS[@]}")
+    if [ -f "$MOCK_DIR/.jobs_state" ]; then
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                ALL_JOBS+=("$line")
+            fi
+        done < "$MOCK_DIR/.jobs_state"
+    fi
+
+    # Find job
+    job_found=0
+    for job_str in "${ALL_JOBS[@]}"; do
+        IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount j_nlist j_cpus j_mem j_gres j_reason j_stdout j_stderr <<< "$job_str"
+        if [ "$j_id" == "$target_id" ]; then
+            job_found=1
+            
+            # Print mock scontrol output for job
+            cat <<EOF
+JobId=$j_id JobName=$j_name
+   UserId=$j_user(1001) GroupId=$j_user(1001) MCS_label=N/A
+   Priority=4294901758 Nice=0 NumberOfTasks=1 OpenMode=APPEND
+   JobState=$j_state Reason=$j_reason Dependency=(null)
+   Requeue=1 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+   RunTime=$j_time TimeLimit=$j_limit TimeMin=N/A
+   SubmitTime=2026-05-20T12:00:00 EligibleTime=2026-05-20T12:00:00
+   StartTime=2026-05-20T12:05:00 EndTime=Unknown Deadline=N/A
+   Partition=$j_part AllocNode:Sid=login01:12345
+   ReqNodeList=(null) ExcNodeList=(null)
+   NodeList=$j_nlist
+   NumNodes=$j_ncount NumCPUs=$j_cpus NumTasks=1 CPUs/Task=1 ReqB:S:C:T=0:0:*:*
+   TRES=cpu=$j_cpus,mem=$(parse_memory_to_gb "$j_mem")G,node=$j_ncount
+   Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*
+   MinCPUsNode=1 MinMemoryNode=$j_mem MinTmpDiskNode=0
+   Features=(null) DelayBoot=00:00:00
+   OverSubscribe=OK Contiguous=0 Licenses=(null) Network=(null)
+   Command=/Users/$j_user/jobs/$j_name.sh
+   WorkDir=$(cd "$MOCK_DIR/.." && pwd)
+   StdErr=${j_stderr:-slurm-$j_id.out}
+   StdIn=/dev/null
+   StdOut=${j_stdout:-slurm-$j_id.out}
+   Power=
+   TresPerNode=gres/gpu=$(echo "$j_gres" | sed 's/gpu://g' | cut -d: -f2)
+EOF
+            break
+        fi
+    done
+    if [ "$job_found" -eq 0 ]; then
+        echo "slurm_load_jobs error: Invalid job id specified" >&2
+        exit 1
+    fi
+
+elif [ "$target_type" == "node" ]; then
+    # Find node
+    node_found=0
+    for node_str in "${MOCK_NODES[@]}"; do
+        IFS='|' read -r n_name n_state n_cpus n_mem n_gres n_reason <<< "$node_str"
+        if [ "$n_name" == "$target_id" ]; then
+            node_found=1
+            
+            # Split allocated vs total CPUs/Mem
+            alloc_cpus=$(echo "$n_cpus" | cut -d/ -f1)
+            total_cpus=$(echo "$n_cpus" | cut -d/ -f2)
+            alloc_mem=$(echo "$n_mem" | cut -d/ -f1)
+            total_mem=$(echo "$n_mem" | cut -d/ -f2)
+            
+            cat <<EOF
+NodeName=$n_name Arch=x86_64 CoresPerSocket=12
+   CPUAlloc=$alloc_cpus CPUTot=$total_cpus CPULoad=1.24
+   AvailableFeatures=(null)
+   ActiveFeatures=(null)
+   Gres=$n_gres
+   GresUsed=gpu:$(echo "$n_gres" | grep -E -o "[0-9]+" | head -n1)
+   NodeAddr=$n_name NodeHostName=$n_name Version=20.11.8
+   OS=Linux 5.4.0-74-generic #83-Ubuntu SMP
+   RealMemory=$total_mem AllocMem=$alloc_mem FreeMem=$((total_mem - alloc_mem)) Sockets=2 Boards=1
+   State=$n_state ThreadsPerCore=2 TmpDisk=0 Weight=1 Owner=N/A MCS_label=N/A
+   BootTime=2026-05-19T08:00:00 SlurmdStartTime=2026-05-19T08:02:00
+   LastBusyTime=2026-05-20T15:00:00
+EOF
+            if [ -n "$n_reason" ]; then
+                echo "   Reason=$n_reason [slurm@2026-05-20T10:00:00]"
+            fi
+            break
+        fi
+    done
+    if [ "$node_found" -eq 0 ]; then
+        echo "slurm_load_node error: Description of node not found" >&2
+        exit 1
+    fi
+else
+    echo "Mock scontrol: Unsupported target type '$target_type'" >&2
+    exit 1
+fi

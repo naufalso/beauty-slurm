@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: Mock scancel command
+# Simulates scancel CLI actions with success feedback.
+
+if [ $# -eq 0 ]; then
+    echo "scancel: error: No job id specified" >&2
+    exit 1
+fi
+
+for arg in "$@"; do
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+        echo "Cancelled job $arg"
+    fi
+done
+exit 0

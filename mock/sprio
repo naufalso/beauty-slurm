@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: Mock sprio command
+# Simulates sprio CLI with format token mappings for job priority analysis.
+
+MOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MOCK_DIR/cluster_state.sh"
+
+FORMAT_STR=""
+FILTER_USER=""
+FILTER_JOB=""
+NO_HEADER=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--format)
+            FORMAT_STR="$2"
+            shift 2
+            ;;
+        -u|--user)
+            FILTER_USER="$2"
+            shift 2
+            ;;
+        -j|--jobs)
+            FILTER_JOB="$2"
+            shift 2
+            ;;
+        -h|--noheader)
+            NO_HEADER=1
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$FORMAT_STR" ]; then
+    FORMAT_STR="JOBID:%i,PRIORITY:%Y,AGE:%a,FAIRSHARE:%f,PARTITION:%p,QOS:%q,TRES:%t"
+fi
+
+# Print header if not suppressed
+if [ "$NO_HEADER" -eq 0 ]; then
+    header_line=""
+    IFS=',' read -r -a format_fields <<< "$FORMAT_STR"
+    for field in "${format_fields[@]}"; do
+        title="${field%%:*}"
+        if [ "$title" == "$field" ]; then
+            title="FIELD"
+        fi
+        title=$(echo "$title" | tr '[:lower:]' '[:upper:]')
+        header_line="${header_line}${title}\t"
+    done
+    echo -e "$header_line" | expand -t 15
+fi
+
+# Loop through mock jobs and output priority profiles
+for job_str in "${MOCK_JOBS[@]}"; do
+    IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount j_nlist j_cpus j_mem j_gres j_reason <<< "$job_str"
+    
+    # Filter by user/job
+    if [ -n "$FILTER_USER" ] && [ "$FILTER_USER" != "$j_user" ]; then
+        continue
+    fi
+    if [ -n "$FILTER_JOB" ] && [ "$FILTER_JOB" != "$j_id" ]; then
+        continue
+    fi
+    
+    # Generate deterministic priority factors based on job IDs
+    age_factor=$(( (j_id % 3) * 350 + 120 ))
+    fair_factor=$(( (j_id % 5) * 800 + 400 ))
+    part_factor=100
+    qos_factor=$(( (j_id % 2) * 2000 + 1000 ))
+    tres_factor=$(( j_cpus * 50 ))
+    total_priority=$(( age_factor + fair_factor + part_factor + qos_factor + tres_factor + 1000 ))
+    
+    # Format line
+    output_line=""
+    IFS=',' read -r -a format_fields <<< "$FORMAT_STR"
+    for field in "${format_fields[@]}"; do
+        token="${field#*:}"
+        
+        val=""
+        case "$token" in
+            %i) val="$j_id" ;;
+            %j) val="$j_name" ;;
+            %Y) val="$total_priority" ;;
+            %a) val="$age_factor" ;;
+            %f) val="$fair_factor" ;;
+            %p) val="$part_factor" ;;
+            %q) val="$qos_factor" ;;
+            %t) val="$tres_factor" ;;
+            %u) val="$j_user" ;;
+            *) val="0" ;;
+        esac
+        
+        output_line="${output_line}${val}\t"
+    done
+    echo -e "$output_line" | expand -t 15
+done

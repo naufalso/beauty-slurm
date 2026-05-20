@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: scluster (Cluster Status Dashboard)
+# Beautified replacement for sinfo. Presents partition usage bars, CPU utilization, 
+# and real-time GPU occupancy audits.
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$BIN_DIR")"
+
+if [ -f "$BASE_DIR/lib/core.sh" ]; then
+    source "$BASE_DIR/lib/core.sh"
+    source "$BASE_DIR/lib/slurm_api.sh"
+else
+    echo "Error: Core libraries not found." >&2
+    exit 1
+fi
+
+# Print Help
+show_help() {
+    cat <<EOF
+${CLR_PURPLE}${STYLE_BOLD}Beauty SLURM: scluster${STYLE_RESET} (Cluster Status Dashboard)
+
+Beautified replacement for standard ${CLR_CYAN}sinfo${STYLE_RESET} command.
+
+${STYLE_BOLD}Usage:${STYLE_RESET} scluster [options]
+
+${STYLE_BOLD}Options:${STYLE_RESET}
+  --color=VAL      Force color modes: auto (default), always, never
+  --mock           Force local mocking layer (for offline testing)
+  -h, --help       Show this help message
+
+All other flags and arguments are directly forwarded to ${CLR_CYAN}sinfo${STYLE_RESET}.
+
+${STYLE_BOLD}Examples:${STYLE_RESET}
+  scluster
+  scluster --color=always
+EOF
+    exit 0
+}
+
+# Check for help
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+    fi
+done
+
+# Parse global flags and bootstrap environment
+parse_global_flags "$@"
+bootstrap_slurm_environment
+
+# Forwarded options
+SINFO_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --color=*|--mock)
+            shift
+            ;;
+        *)
+            SINFO_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# 1. Fetch partition details
+# Format: Name | State | TimeLimit | Nodes(A/I/O/T) | CPUs(A/I/O/T) | NodesList
+raw_partitions=$(sinfo "${SINFO_ARGS[@]}" -h -o "%P|%a|%l|%F|%C|%N" 2>&1)
+exit_code=$?
+
+if [ "$exit_code" -ne 0 ]; then
+    echo -e "$raw_partitions" >&2
+    exit "$exit_code"
+fi
+
+if [ -z "$raw_partitions" ]; then
+    warn "No partition details found."
+    exit 0
+fi
+
+# 2. Fetch GPU configs and model types across all nodes to build partition totals
+# Format: Partition | GRES
+raw_gpus=$(sinfo "${SINFO_ARGS[@]}" -N -h -o "%P|%G" 2>/dev/null)
+
+# Create key-value variables dynamically to track total GPUs and models per partition
+# Formats: 
+#   PART_GPU_TOTAL_<part_name>=num
+#   PART_GPU_MODEL_<part_name>=string
+while read -r part_gres_line; do
+    if [ -z "$part_gres_line" ]; then continue; fi
+    part_name=$(echo "$part_gres_line" | cut -d'|' -f1)
+    gres_str=$(echo "$part_gres_line" | cut -d'|' -f2)
+    
+    # Clean trailing * if partition is default, e.g. compute* -> compute
+    part_name="${part_name%\*}"
+    
+    # Parse GRES for GPUs
+    gpu_prettified=$(parse_gres "$gres_str")
+    if [ -n "$gpu_prettified" ]; then
+        # e.g. "4x A100" or "1x GPU"
+        if [[ "$gpu_prettified" =~ ^([0-9]+)x[[:space:]](.+)$ ]]; then
+            count="${BASH_REMATCH[1]}"
+            model="${BASH_REMATCH[2]}"
+            
+            # Aggregate totals in variables compatible with Bash 3.2
+            var_total="PART_GPU_TOTAL_${part_name}"
+            var_model="PART_GPU_MODEL_${part_name}"
+            
+            current_total="${!var_total:-0}"
+            eval "${var_total}=$((current_total + count))"
+            eval "${var_model}=\"${model}\""
+        fi
+    fi
+done <<< "$raw_gpus"
+
+# 3. Fetch running GPU allocations from squeue to count allocated GPUs per partition
+# Format: Partition | GRES | State
+raw_jobs=$(squeue -h -o "%P|%b|%T" 2>/dev/null)
+
+while read -r job_line; do
+    if [ -z "$job_line" ]; then continue; fi
+    part_name=$(echo "$job_line" | cut -d'|' -f1)
+    gres_str=$(echo "$job_line" | cut -d'|' -f2)
+    state_str=$(echo "$job_line" | cut -d'|' -f3)
+    
+    # Clean trailing * if partition is default
+    part_name="${part_name%\*}"
+    
+    if [ "$state_str" == "RUNNING" ]; then
+        gpu_prettified=$(parse_gres "$gres_str")
+        if [ -n "$gpu_prettified" ]; then
+            if [[ "$gpu_prettified" =~ ^([0-9]+)x[[:space:]](.+)$ ]]; then
+                count="${BASH_REMATCH[1]}"
+                var_alloc="PART_GPU_ALLOC_${part_name}"
+                current_alloc="${!var_alloc:-0}"
+                eval "${var_alloc}=$((current_alloc + count))"
+            fi
+        fi
+    fi
+done <<< "$raw_jobs"
+
+# Define layout widths
+W_PART=13
+W_STAT=8
+W_WALL=10
+W_NODES=15
+W_BAR=25
+W_GPU=18
+
+# Print Header
+hdr_part=$(pad_right "PARTITION" $W_PART)
+hdr_stat=$(pad_right "STATUS" $W_STAT)
+hdr_wall=$(pad_right "WALLTIME" $W_WALL)
+hdr_nodes=$(pad_right "NODES (A/I/O/T)" $W_NODES)
+hdr_bar=$(pad_right "CPU UTILIZATION" $W_BAR)
+hdr_gpu=$(pad_right "GPU OCCUPANCY" $W_GPU)
+hdr_nlist="NODELIST"
+
+if [ -n "$STYLE_BOLD" ]; then
+    echo -e "${STYLE_BOLD}${COLOR_PRIMARY}${hdr_part} ${hdr_stat} ${hdr_wall} ${hdr_nodes} ${hdr_bar} ${hdr_gpu} ${hdr_nlist}${STYLE_RESET}"
+    echo -e "${CLR_GREY}$(pad_right "" 115 "-")${STYLE_RESET}"
+else
+    echo -e "${hdr_part} ${hdr_stat} ${hdr_wall} ${hdr_nodes} ${hdr_bar} ${hdr_gpu} ${hdr_nlist}"
+    echo -e "$(pad_right "" 115 "-")"
+fi
+
+# Print Rows
+while IFS='|' read -r p_name p_state p_limit p_nodes p_cpus p_nlist; do
+    if [ -z "$p_name" ]; then continue; fi
+    
+    # Strip trailing asterisk representing default partition
+    p_name_clean="${p_name%\*}"
+    is_default=0
+    if [[ "$p_name" == *\* ]]; then
+        is_default=1
+    fi
+    
+    # 1. Format Partition Name (Highlight default in green)
+    f_part="$p_name"
+    if [ "$is_default" -eq 1 ] && [ -n "$CLR_GREEN" ]; then
+        f_part="${STYLE_BOLD}${CLR_GREEN}${p_name_clean}*${STYLE_RESET}"
+    fi
+    f_part=$(pad_right "$f_part" $W_PART)
+    
+    # 2. Format Status
+    f_stat=""
+    if [ "$p_state" == "up" ]; then
+        if [ -n "$CLR_GREEN" ]; then
+            f_stat="${CLR_GREEN}ONLINE${STYLE_RESET}"
+        else
+            f_stat="ONLINE"
+        fi
+    else
+        if [ -n "$CLR_RED" ]; then
+            f_stat="${STYLE_BOLD}${CLR_RED}OFFLINE${STYLE_RESET}"
+        else
+            f_stat="OFFLINE"
+        fi
+    fi
+    f_stat=$(pad_right "$f_stat" $W_STAT)
+    
+    # 3. Format Walltime
+    f_wall=$(pad_right "$p_limit" $W_WALL)
+    
+    # 4. Format Node Count Breakdown
+    f_nodes=$(pad_right "$p_nodes" $W_NODES)
+    
+    # 5. Format CPU Progress Bar
+    # Parse CPU breakdown (Alloc/Idle/Other/Total)
+    IFS='/' read -r cpu_alloc cpu_idle cpu_other cpu_total <<< "$p_cpus"
+    cpu_pct=0
+    if [ "${cpu_total:-0}" -gt 0 ]; then
+        cpu_pct=$(( cpu_alloc * 100 / cpu_total ))
+    fi
+    
+    cpu_bar=$(draw_bar $cpu_pct 10)
+    cpu_info=$(printf "%2d%% (%d/%d)" "$cpu_pct" "$cpu_alloc" "$cpu_total")
+    f_bar=$(pad_right "$cpu_bar $cpu_info" $W_BAR)
+    
+    # 6. Format GPU Occupancy
+    # Read aggregated GPU counts for this partition
+    total_gpus_var="PART_GPU_TOTAL_${p_name_clean}"
+    alloc_gpus_var="PART_GPU_ALLOC_${p_name_clean}"
+    model_gpus_var="PART_GPU_MODEL_${p_name_clean}"
+    
+    total_gpus="${!total_gpus_var:-0}"
+    alloc_gpus="${!alloc_gpus_var:-0}"
+    model_gpus="${!model_gpus_var:-}"
+    
+    f_gpu="-"
+    if [ "$total_gpus" -gt 0 ]; then
+        idle_gpus=$((total_gpus - alloc_gpus))
+        
+        gpu_count_str="${alloc_gpus}/${total_gpus}"
+        # Build colored GPU tag
+        if [ -n "$CLR_ORANGE" ]; then
+            if [ "$idle_gpus" -gt 0 ]; then
+                # Some GPUs are free, highlight availability in active orange
+                f_gpu="${STYLE_BOLD}${CLR_ORANGE}${ICON_GPU} ${gpu_count_str} ${model_gpus}${STYLE_RESET}"
+            else
+                # All GPUs are fully occupied
+                f_gpu="${CLR_GREY}${ICON_GPU} ${gpu_count_str} ${model_gpus}${STYLE_RESET}"
+            fi
+        else
+            f_gpu="${ICON_GPU} ${gpu_count_str} ${model_gpus}"
+        fi
+    fi
+    f_gpu=$(pad_right "$f_gpu" $W_GPU)
+    
+    # 7. Nodelist
+    f_nlist=""
+    if [ -n "$CLR_CYAN" ]; then
+        f_nlist="${CLR_CYAN}${p_nlist}${STYLE_RESET}"
+    else
+        f_nlist="$p_nlist"
+    fi
+    
+    echo -e "${f_part} ${f_stat} ${f_wall} ${f_nodes} ${f_bar} ${f_gpu} ${f_nlist}"
+    
+done <<< "$raw_partitions"

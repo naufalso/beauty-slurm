@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: srun-quick (Interactive Compute Session Launcher)
+# Simplifies srun invocation by providing pre-configured profiles for interactive work/debugging.
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$BIN_DIR")"
+
+if [ -f "$BASE_DIR/lib/core.sh" ]; then
+    source "$BASE_DIR/lib/core.sh"
+    source "$BASE_DIR/lib/slurm_api.sh"
+else
+    echo "Error: Core libraries not found." >&2
+    exit 1
+fi
+
+show_help() {
+    cat <<EOF
+${CLR_PURPLE}${STYLE_BOLD}Beauty SLURM: srun-quick${STYLE_RESET} (Interactive Compute Launcher)
+
+Launches pre-configured, interactive compute sessions with standard resource profiles.
+
+${STYLE_BOLD}Usage:${STYLE_RESET} srun-quick [options] [-- [additional-srun-flags]]
+
+${STYLE_BOLD}Options:${STYLE_RESET}
+  -g, --gpu VAL    Request GPUs (e.g. '1', 'a100:2', 'v100'). Automatically binds GPU partition.
+  -c, --cpu VAL    Request CPU cores (default: 4 for GPU nodes, 2 for CPU nodes)
+  -m, --mem VAL    Request node memory (default: 16G for GPU nodes, 8G for CPU nodes)
+  -p, --part VAL   Specify Slurm partition (auto-resolves to 'gpu' if --gpu is specified)
+  -t, --time VAL   Max session duration (default: 02:00:00)
+  -s, --shell VAL  Terminal shell binary to run (default: bash)
+  --color=VAL      Force color modes: auto (default), always, never
+  --mock           Force local mocking layer (for offline testing)
+  -h, --help       Show this help message
+
+${STYLE_BOLD}Examples:${STYLE_RESET}
+  srun-quick --gpu a100
+  srun-quick --cpu 8 --mem 32G
+  srun-quick --gpu 2 --part=gpu_reserved
+EOF
+    exit 0
+}
+
+# Check for help
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+    fi
+done
+
+# Parse global flags
+parse_global_flags "$@"
+
+# Option parsing variables
+REQ_GPU=""
+REQ_CPU=""
+REQ_MEM=""
+REQ_PART=""
+REQ_TIME="02:00:00"
+REQ_SHELL="bash"
+EXTRA_SRUN_ARGS=()
+
+# Parse parameters
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -g|--gpu)
+            REQ_GPU="$2"
+            shift 2
+            ;;
+        --gpu=*)
+            REQ_GPU="${1#*=}"
+            shift
+            ;;
+        -c|--cpu)
+            REQ_CPU="$2"
+            shift 2
+            ;;
+        --cpu=*)
+            REQ_CPU="${1#*=}"
+            shift
+            ;;
+        -m|--mem)
+            REQ_MEM="$2"
+            shift 2
+            ;;
+        --mem=*)
+            REQ_MEM="${1#*=}"
+            shift
+            ;;
+        -p|--part)
+            REQ_PART="$2"
+            shift 2
+            ;;
+        --part=*)
+            REQ_PART="${1#*=}"
+            shift
+            ;;
+        -t|--time)
+            REQ_TIME="$2"
+            shift 2
+            ;;
+        --time=*)
+            REQ_TIME="${1#*=}"
+            shift
+            ;;
+        -s|--shell)
+            REQ_SHELL="$2"
+            shift 2
+            ;;
+        --shell=*)
+            REQ_SHELL="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            # Everything after -- is forwarded directly to srun
+            while [[ $# -gt 0 ]]; do
+                EXTRA_SRUN_ARGS+=("$1")
+                shift
+            done
+            ;;
+        --color=*|--mock)
+            shift
+            ;;
+        *)
+            error "Unknown parameter '$1'"
+            exit 1
+            ;;
+    esac
+done
+
+# Default values based on GPU vs CPU profile
+if [ -n "$REQ_GPU" ]; then
+    # GPU Profile
+    [ -z "$REQ_CPU" ] && REQ_CPU="4"
+    [ -z "$REQ_MEM" ] && REQ_MEM="16G"
+    [ -z "$REQ_PART" ] && REQ_PART="gpu"
+    
+    # Format GRES
+    # If REQ_GPU is a single number, e.g. "2" -> gpu:2
+    # If REQ_GPU specifies type, e.g. "a100:1" -> gpu:a100:1
+    # If REQ_GPU is a card model name, e.g. "v100" -> gpu:v100:1
+    GRES_ARG=""
+    if [[ "$REQ_GPU" =~ ^[0-9]+$ ]]; then
+        GRES_ARG="gpu:$REQ_GPU"
+    elif [[ "$REQ_GPU" =~ ^[a-zA-Z0-9_-]+:[0-9]+$ ]]; then
+        GRES_ARG="gpu:$REQ_GPU"
+    else
+        GRES_ARG="gpu:$REQ_GPU:1"
+    fi
+else
+    # CPU Profile
+    [ -z "$REQ_CPU" ] && REQ_CPU="2"
+    [ -z "$REQ_MEM" ] && REQ_MEM="8G"
+fi
+
+# Assemble srun arguments
+SRUN_CMD=("srun")
+
+# Append partition if set
+if [ -n "$REQ_PART" ]; then
+    SRUN_CMD+=("-p" "$REQ_PART")
+fi
+
+# Append core resources
+SRUN_CMD+=("--cpus-per-task=$REQ_CPU")
+SRUN_CMD+=("--mem=$REQ_MEM")
+SRUN_CMD+=("--time=$REQ_TIME")
+
+# Append GPU resource if active
+if [ -n "$GRES_ARG" ]; then
+    SRUN_CMD+=("--gres=$GRES_ARG")
+fi
+
+# Make it an interactive shell allocation
+SRUN_CMD+=("--pty")
+SRUN_CMD+=("$REQ_SHELL" "-i")
+
+# Add any additional arguments the user wanted to forward
+if [ "${#EXTRA_SRUN_ARGS[@]}" -gt 0 ]; then
+    SRUN_CMD+=("${EXTRA_SRUN_ARGS[@]}")
+fi
+
+bootstrap_slurm_environment
+
+# Announce session details
+info "Launching interactive allocation session..."
+echo -e "  • ${STYLE_BOLD}Partition:${STYLE_RESET} ${REQ_PART:-Default}"
+echo -e "  • ${STYLE_BOLD}CPUs:${STYLE_RESET}      $REQ_CPU cores"
+echo -e "  • ${STYLE_BOLD}Memory:${STYLE_RESET}    $REQ_MEM"
+[ -n "$GRES_ARG" ] && echo -e "  • ${STYLE_BOLD}GPUs:${STYLE_RESET}      ${CLR_ORANGE}${ICON_GPU} $GRES_ARG${STYLE_RESET}"
+echo -e "  • ${STYLE_BOLD}Time Limit:${STYLE_RESET} $REQ_TIME"
+echo -e "  • ${STYLE_BOLD}Command:${STYLE_RESET}    ${CLR_CYAN}${SRUN_CMD[*]}${STYLE_RESET}"
+echo -e "${CLR_GREY}Connecting to allocation...${STYLE_RESET}\n"
+
+# Execute command
+"${SRUN_CMD[@]}"
+exit_code=$?
+
+if [ "$exit_code" -eq 0 ]; then
+    success "Session closed successfully."
+else
+    # Only report exit code if not normal shell exit
+    if [ "$exit_code" -ne 130 ]; then
+        warn "Session closed with exit code: $exit_code"
+    fi
+fi
+exit "$exit_code"

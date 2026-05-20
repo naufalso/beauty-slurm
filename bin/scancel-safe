@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: scancel-safe (Safe & Guarded Job Canceller)
+# Replaces scancel, displays a rich summary of the job being cancelled, and confirms to prevent mistakes.
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$BIN_DIR")"
+
+if [ -f "$BASE_DIR/lib/core.sh" ]; then
+    source "$BASE_DIR/lib/core.sh"
+    source "$BASE_DIR/lib/slurm_api.sh"
+else
+    echo "Error: Core libraries not found." >&2
+    exit 1
+fi
+
+show_help() {
+    cat <<EOF
+${CLR_PURPLE}${STYLE_BOLD}Beauty SLURM: scancel-safe${STYLE_RESET} (Safe Job Canceller)
+
+Guarded wrapper for ${CLR_RED}scancel${STYLE_RESET} that displays job details and asks for confirmation.
+
+${STYLE_BOLD}Usage:${STYLE_RESET} scancel-safe [options] <job_id1> [job_id2 ...]
+       scancel-safe [options] -u <username>
+
+${STYLE_BOLD}Options:${STYLE_RESET}
+  -y, --yes        Force confirmation (bypass confirmation dialogs)
+  --color=VAL      Force color modes: auto (default), always, never
+  --mock           Force local mocking layer (for offline testing)
+  -h, --help       Show this help message
+
+All other options are directly forwarded to ${CLR_RED}scancel${STYLE_RESET}.
+
+${STYLE_BOLD}Examples:${STYLE_RESET}
+  scancel-safe 100234
+  scancel-safe -u $USER
+EOF
+    exit 0
+}
+
+# Check for help
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+    fi
+done
+
+# Parse global flags
+parse_global_flags "$@"
+
+# Check for yes/force flag and separate Job IDs vs user filters
+FORCE_YES=0
+CANCEL_JOBS=()
+USER_FILTER=""
+SCANCEL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)
+            FORCE_YES=1
+            shift
+            ;;
+        -u|--user)
+            USER_FILTER="$2"
+            SCANCEL_ARGS+=("-u" "$2")
+            shift 2
+            ;;
+        --user=*)
+            USER_FILTER="${1#*=}"
+            SCANCEL_ARGS+=("$1")
+            shift
+            ;;
+        --color=*|--mock)
+            shift
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                CANCEL_JOBS+=("$1")
+            else
+                SCANCEL_ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+bootstrap_slurm_environment
+
+# Helper to print job details beautifully
+print_job_summary() {
+    local job_id="$1"
+    local details
+    details=$(scontrol show job "$job_id" 2>/dev/null)
+    if [ -z "$details" ]; then
+        warn "Could not fetch details for Job ID $job_id."
+        return 1
+    fi
+    
+    local j_name j_state j_part j_user j_time j_limit j_cpus j_mem j_gres
+    j_name=$(echo "$details" | grep -E -o "JobName=[^ ]+" | cut -d= -f2)
+    j_state=$(echo "$details" | grep -E -o "State=[^ ]+" | cut -d= -f2)
+    j_part=$(echo "$details" | grep -E -o "Partition=[^ ]+" | cut -d= -f2)
+    j_user=$(echo "$details" | grep -E -o "UserId=[^(]+" | cut -d= -f2)
+    j_time=$(echo "$details" | grep -E -o "RunTime=[^ ]+" | cut -d= -f2)
+    j_limit=$(echo "$details" | grep -E -o "TimeLimit=[^ ]+" | cut -d= -f2)
+    j_cpus=$(echo "$details" | grep -E -o "NumCPUs=[^ ]+" | cut -d= -f2)
+    j_mem=$(echo "$details" | grep -E -o "MinMemoryNode=[^ ]+" | cut -d= -f2)
+    j_gres=$(echo "$details" | grep -E -o "TRES=[^ ]+" | cut -d= -f2 | grep -E -o "gres/gpu=[^,]+")
+    
+    # Prettify memory
+    local mem_gb
+    mem_gb=$(parse_memory_to_gb "$j_mem")
+    
+    # Prettify GPUs
+    local gpu_prettified=""
+    if [ -n "$j_gres" ]; then
+        gpu_prettified=$(parse_gres "${j_gres/gres\//}")
+    fi
+    
+    local res_str="${j_cpus} Cores"
+    if [ "$mem_gb" -gt 0 ]; then res_str="${res_str} | ${mem_gb}GB Memory"; fi
+    if [ -n "$gpu_prettified" ]; then res_str="${res_str} | ${ICON_GPU} ${gpu_prettified}"; fi
+
+    echo -e "  • ${STYLE_BOLD}Job ID:${STYLE_RESET}    ${CLR_PURPLE}${job_id}${STYLE_RESET}"
+    echo -e "    ${STYLE_BOLD}Name:${STYLE_RESET}      ${j_name}"
+    echo -e "    ${STYLE_BOLD}Partition:${STYLE_RESET} ${j_part}"
+    echo -e "    ${STYLE_BOLD}State:${STYLE_RESET}     ${j_state}"
+    echo -e "    ${STYLE_BOLD}Time Used:${STYLE_RESET} ${j_time} / ${j_limit}"
+    echo -e "    ${STYLE_BOLD}Resources:${STYLE_RESET} ${res_str}"
+    echo ""
+}
+
+# Main routing
+if [ -n "$USER_FILTER" ]; then
+    # Bulk user job cancellation request
+    # Fetch list of active jobs for this user
+    raw_user_jobs=$(squeue -u "$USER_FILTER" -h -o "%i|%j|%T|%P" 2>/dev/null)
+    job_count=$(echo "$raw_user_jobs" | grep -c "^" || echo 0)
+    
+    if [ "$job_count" -eq 0 ]; then
+        success "No active or pending jobs found for user '$USER_FILTER'."
+        exit 0
+    fi
+    
+    echo -e "${CLR_RED}${STYLE_BOLD}⚠️  CRITICAL WARNING: Bulk Cancellation Requested${STYLE_RESET}"
+    echo -e "You are about to cancel ${STYLE_BOLD}${job_count}${STYLE_RESET} jobs owned by user ${CLR_GREEN}'$USER_FILTER'${STYLE_RESET}:"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    
+    # List them cleanly
+    while IFS='|' read -r j_id j_name j_state j_part; do
+        if [ -z "$j_id" ]; then continue; fi
+        echo -e "  [${CLR_PURPLE}${j_id}${STYLE_RESET}]  State: $(pad_right "$j_state" 8)  Name: $(pad_right "$j_name" 15)  Partition: $j_part"
+    done <<< "$raw_user_jobs"
+    
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    
+    if [ "$FORCE_YES" -eq 1 ]; then
+        scancel "${SCANCEL_ARGS[@]}"
+        success "Bulk cancellation completed successfully."
+        exit 0
+    fi
+    
+    # Prompt for confirmation
+    read -p "Are you absolutely sure you want to terminate these $job_count jobs? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        info "Executing bulk cancel..."
+        scancel_output=$(scancel "${SCANCEL_ARGS[@]}" 2>&1)
+        if [ $? -eq 0 ]; then
+            success "Successfully cancelled all $job_count jobs for user '$USER_FILTER'."
+        else
+            error "scancel failed:"
+            echo "$scancel_output" >&2
+        fi
+    else
+        warn "Cancellation aborted."
+    fi
+
+elif [ "${#CANCEL_JOBS[@]}" -gt 0 ]; then
+    # Specific jobs requested
+    echo -e "${STYLE_BOLD}Target Job Details for Termination:${STYLE_RESET}"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    
+    for job_id in "${CANCEL_JOBS[@]}"; do
+        print_job_summary "$job_id"
+    done
+    
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    
+    if [ "$FORCE_YES" -eq 1 ]; then
+        scancel "${CANCEL_JOBS[@]}" "${SCANCEL_ARGS[@]}"
+        success "Job cancellation completed."
+        exit 0
+    fi
+    
+    # Ask for confirmation
+    read -p "Do you want to proceed and terminate these jobs? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        info "Cancelling jobs..."
+        scancel_output=$(scancel "${CANCEL_JOBS[@]}" "${SCANCEL_ARGS[@]}" 2>&1)
+        if [ $? -eq 0 ]; then
+            success "Successfully terminated requested job(s)."
+        else
+            error "scancel failed:"
+            echo "$scancel_output" >&2
+        fi
+    else
+        warn "Cancellation aborted."
+    fi
+else
+    error "No Job ID or user filter specified."
+    echo "Usage: scancel-safe <job_id>"
+    exit 1
+fi

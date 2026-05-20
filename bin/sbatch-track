@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: sbatch-track (Interactive Submitter & Log Tracker)
+# Wraps sbatch, validates SBATCH directives beforehand, and streams output log in real-time.
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$BIN_DIR")"
+
+if [ -f "$BASE_DIR/lib/core.sh" ]; then
+    source "$BASE_DIR/lib/core.sh"
+    source "$BASE_DIR/lib/slurm_api.sh"
+else
+    echo "Error: Core libraries not found." >&2
+    exit 1
+fi
+
+show_help() {
+    cat <<EOF
+${CLR_PURPLE}${STYLE_BOLD}Beauty SLURM: sbatch-track${STYLE_RESET} (Interactive Submitter & Tracker)
+
+Pre-flight linter and real-time output tracker for ${CLR_CYAN}sbatch${STYLE_RESET}.
+
+${STYLE_BOLD}Usage:${STYLE_RESET} sbatch-track [options] [sbatch-options] <script.sh>
+
+${STYLE_BOLD}Options:${STYLE_RESET}
+  -t, --track      Automatically wait for the job to start and stream its log file
+  --color=VAL      Force color modes: auto (default), always, never
+  --mock           Force local mocking layer (for offline testing)
+  -h, --help       Show this help message
+
+All other flags and arguments are directly forwarded to ${CLR_CYAN}sbatch${STYLE_RESET}.
+
+${STYLE_BOLD}Examples:${STYLE_RESET}
+  sbatch-track -t run_job.sh
+  sbatch-track --partition=gpu -t run_gpu_job.sh
+EOF
+    exit 0
+}
+
+# Check for help
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+    fi
+done
+
+# Parse global flags
+parse_global_flags "$@"
+
+# Extract tracking option and script file
+TRACK_MODE=0
+SBATCH_ARGS=()
+script_file=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--track)
+            TRACK_MODE=1
+            shift
+            ;;
+        --color=*|--mock)
+            shift
+            ;;
+        *)
+            SBATCH_ARGS+=("$1")
+            # If it's a file, remember it as the script file
+            if [[ "$1" != -* ]]; then
+                script_file="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$script_file" ]; then
+    error "No submission script specified."
+    echo "Usage: sbatch-track [-t] <script.sh>"
+    exit 1
+fi
+
+# Check if output or error paths are defined in CLI or script directives
+has_output=0
+has_error=0
+
+# Check command line arguments
+for ((i=0; i<${#SBATCH_ARGS[@]}; i++)); do
+    arg="${SBATCH_ARGS[i]}"
+    if [[ "$arg" == "-o" || "$arg" == "--output" ]]; then
+        has_output=1
+    elif [[ "$arg" == --output=* ]]; then
+        has_output=1
+    elif [[ "$arg" == "-e" || "$arg" == "--error" ]]; then
+        has_error=1
+    elif [[ "$arg" == --error=* ]]; then
+        has_error=1
+    fi
+done
+
+# Check script directives
+if [ -f "$script_file" ]; then
+    if grep -E -q "^#SBATCH[[:space:]]+(-o|--output)" "$script_file"; then
+        has_output=1
+    fi
+    if grep -E -q "^#SBATCH[[:space:]]+(-e|--error)" "$script_file"; then
+        has_error=1
+    fi
+fi
+
+# Apply defaults if not specified
+if [ "$has_output" -eq 0 ] || [ "$has_error" -eq 0 ]; then
+    date_dir=$(date +%y%m%d)
+    log_dir="./logs/${date_dir}"
+    
+    if [ ! -d "$log_dir" ]; then
+        info "Creating default date-based log directory: $log_dir"
+        mkdir -p "$log_dir"
+    fi
+    
+    if [ "$has_output" -eq 0 ]; then
+        SBATCH_ARGS+=("--output=${log_dir}/%x-%j.out")
+        info "Auto-assigned default stdout: ${CLR_CYAN}${log_dir}/%x-%j.out${STYLE_RESET}"
+    fi
+    
+    if [ "$has_error" -eq 0 ]; then
+        SBATCH_ARGS+=("--error=${log_dir}/%x-%j.err")
+        info "Auto-assigned default stderr: ${CLR_CYAN}${log_dir}/%x-%j.err${STYLE_RESET}"
+    fi
+fi
+
+# Pre-flight Linting Checks
+lint_script() {
+    local script="$1"
+    if [ ! -f "$script" ]; then
+        error "Submission script '$script' not found."
+        exit 1
+    fi
+
+    # Read first line
+    local shebang
+    read -r shebang < "$script"
+    if [[ "$shebang" != "#!"* ]]; then
+        warn "Script does not contain a standard shebang line (e.g. #!/bin/bash)."
+    fi
+
+    # Check for #SBATCH directives
+    local sbatch_count
+    sbatch_count=$(grep -c "^#SBATCH" "$script")
+    if [ "$sbatch_count" -eq 0 ]; then
+        warn "No '#SBATCH' directives found. The job will submit under default queue limits."
+    fi
+
+    # Check for invalid output directory
+    # Common crash: #SBATCH -o logs/slurm-%j.out but the folder logs/ does not exist.
+    local output_directive
+    output_directive=$(grep -E "^#SBATCH[[:space:]]+(-o|--output)=" "$script" || grep -E "^#SBATCH[[:space:]]+(-o|--output)[[:space:]]+" "$script")
+    if [ -n "$output_directive" ]; then
+        local log_val
+        log_val=$(echo "$output_directive" | sed -E 's/^#SBATCH[[:space:]]+(-o|--output)=?//' | tr -d '"' | tr -d "'")
+        
+        # Resolve folder name
+        local log_dir
+        log_dir=$(dirname "$log_val")
+        if [[ "$log_dir" != "." && "$log_dir" != "/" && ! -d "$log_dir" && "$log_val" != "/dev/null" ]]; then
+            warn "Target log folder '$log_dir' does not exist. The job will crash immediately unless created."
+            
+            # Interactive folder creation
+            if [ -t 0 ]; then
+                read -p "Would you like me to create this folder now? [Y/n] " -n 1 -r
+                echo ""
+                if [[ $REPLY =~ ^[Yy]$ || -z $REPLY ]]; then
+                    mkdir -p "$log_dir" && success "Folder '$log_dir' created successfully!"
+                fi
+            fi
+        fi
+    fi
+}
+
+# Run Linter
+info "Performing pre-flight linting on $script_file..."
+lint_script "$script_file"
+
+# Bootstrap SLURM path
+bootstrap_slurm_environment
+
+# Submit job
+info "Submitting job to SLURM..."
+submit_output=$(sbatch "${SBATCH_ARGS[@]}" 2>&1)
+exit_code=$?
+
+if [ "$exit_code" -ne 0 ]; then
+    error "Submission failed:"
+    echo "$submit_output" >&2
+    exit "$exit_code"
+fi
+
+# Print submission result
+echo -e "$submit_output"
+JOB_ID=$(echo "$submit_output" | grep -E -o "[0-9]+")
+
+if [ -z "$JOB_ID" ]; then
+    error "Could not parse submitted Job ID."
+    exit 1
+fi
+
+# If tracking mode is disabled, exit here
+if [ "$TRACK_MODE" -eq 0 ]; then
+    success "Job submitted successfully. Run 'sjobs --me' to monitor."
+    exit 0
+fi
+
+# Start Tracking Loop
+info "Starting real-time tracking for Job ID: ${CLR_PURPLE}${JOB_ID}${STYLE_RESET}"
+echo -e "${CLR_GREY}Watching for state transitions (PENDING ➔ RUNNING)...${STYLE_RESET}"
+
+state=""
+log_path=""
+
+while true; do
+    details=$(scontrol show job "$JOB_ID" 2>/dev/null)
+    if [ -z "$details" ]; then
+        error "Job $JOB_ID record could not be found in scheduler."
+        exit 1
+    fi
+    
+    state=$(echo "$details" | grep -E -o "JobState=[^ ]+" | cut -d= -f2)
+    log_path=$(get_job_log_file "$JOB_ID")
+    
+    if [[ "$state" == "RUNNING" || "$state" == "COMPLETED" || "$state" == "COMPLETING" || "$state" == "FAILED" || "$state" == "CANCELLED" || "$state" == "TIMEOUT" ]]; then
+        break
+    fi
+    
+    # Periodic inline pending diagnosis print
+    reason=$(echo "$details" | grep -E -o "Reason=[^ ]+" | cut -d= -f2)
+    friendly_reason=$(translate_pending_reason "$reason")
+    printf "\r⏳ State: ${CLR_YELLOW}PENDING${STYLE_RESET} (%b)                  " "$friendly_reason"
+    sleep 1.5
+done
+echo ""
+
+if [[ "$state" == "FAILED" || "$state" == "CANCELLED" || "$state" == "TIMEOUT" ]]; then
+    error "Job failed immediately during launch with status: $state"
+    exit 1
+fi
+
+# Locate and touch logs
+log_files=()
+while IFS= read -r line; do
+    log_files+=("$line")
+done < <(get_job_log_files "$JOB_ID")
+
+log_out="${log_files[0]}"
+log_err="${log_files[1]}"
+
+if [ -z "$log_out" ]; then
+    warn "StdOut log path could not be resolved from scheduler details."
+    exit 0
+fi
+
+# Touch files to prevent tail from complaining if they aren't generated yet
+touch "$log_out" 2>/dev/null
+
+if [[ -n "$log_err" && "$log_err" != "$log_out" ]]; then
+    touch "$log_err" 2>/dev/null
+    info "Streaming StdOut: ${CLR_CYAN}${log_out}${STYLE_RESET}"
+    info "Streaming StdErr: ${CLR_RED}${log_err}${STYLE_RESET}"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    tail -f "$log_out" "$log_err" &
+    tail_pid=$!
+else
+    info "Streaming output log: ${CLR_CYAN}${log_out}${STYLE_RESET}"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    tail -f "$log_out" &
+    tail_pid=$!
+fi
+
+# Ctrl+C cleanup trap
+trap 'kill $tail_pid 2>/dev/null; echo -e "\n${CLR_ORANGE}⚠️  Stopped tracking. Job is still running.${STYLE_RESET}"; exit 0' INT
+
+# Wait for completion
+while true; do
+    sleep 1.5
+    details=$(scontrol show job "$JOB_ID" 2>/dev/null)
+    if [ -z "$details" ]; then
+        break
+    fi
+    
+    state=$(echo "$details" | grep -E -o "JobState=[^ ]+" | cut -d= -f2)
+    if [[ "$state" != "RUNNING" && "$state" != "COMPLETING" ]]; then
+        break
+    fi
+done
+
+# Flush
+sleep 1
+kill $tail_pid 2>/dev/null
+
+echo -e "\n${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+if [ "$state" == "COMPLETED" ]; then
+    success "Job finished successfully!"
+else
+    error "Job finished with status: $state"
+fi

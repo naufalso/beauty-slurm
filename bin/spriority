@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: spriority (Beautified Job Priority Inspector)
+# Wraps sprio, displays a gorgeous, color-aligned matrix of priority weights,
+# automatically identifying and highlighting the dominant priority factor.
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$BIN_DIR")"
+
+if [ -f "$BASE_DIR/lib/core.sh" ]; then
+    source "$BASE_DIR/lib/core.sh"
+    source "$BASE_DIR/lib/slurm_api.sh"
+else
+    echo "Error: Core libraries not found." >&2
+    exit 1
+fi
+
+show_help() {
+    cat <<EOF
+${CLR_PURPLE}${STYLE_BOLD}Beauty SLURM: spriority${STYLE_RESET} (Job Priority Inspector)
+
+Beautified replacement for standard ${CLR_CYAN}sprio${STYLE_RESET} command.
+
+${STYLE_BOLD}Usage:${STYLE_RESET} spriority [options] [sprio-options]
+
+${STYLE_BOLD}Options:${STYLE_RESET}
+  --color=VAL      Force color modes: auto (default), always, never
+  --mock           Force local mocking layer (for offline testing)
+  -h, --help       Show this help message
+
+All other flags and arguments are directly forwarded to ${CLR_CYAN}sprio${STYLE_RESET}.
+By default, filters by your username (${CLR_GREEN}$USER${STYLE_RESET}) if no specific job ID or user is passed.
+
+${STYLE_BOLD}Examples:${STYLE_RESET}
+  spriority
+  spriority -j 100238
+  spriority -u alice
+EOF
+    exit 0
+}
+
+# Check for help
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+    fi
+done
+
+# Parse global flags
+parse_global_flags "$@"
+
+# Option parsing
+SPRIO_ARGS=()
+HAS_USER_OR_JOB=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--user|-j|--jobs)
+            HAS_USER_OR_JOB=1
+            SPRIO_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        -u*|-j*)
+            HAS_USER_OR_JOB=1
+            SPRIO_ARGS+=("$1")
+            shift
+            ;;
+        --user=*|--jobs=*)
+            HAS_USER_OR_JOB=1
+            SPRIO_ARGS+=("$1")
+            shift
+            ;;
+        --color=*|--mock)
+            shift
+            ;;
+        *)
+            SPRIO_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Default to current user if no specific job/user query is present
+if [ "$HAS_USER_OR_JOB" -eq 0 ]; then
+    SPRIO_ARGS+=("-u" "$USER")
+fi
+
+bootstrap_slurm_environment
+
+# Run sprio
+# Format: JobID | JobName | TotalPriority | Age | Fairshare | Partition | QOS | TRES
+raw_priority=$(sprio "${SPRIO_ARGS[@]}" -h -o "%i|%j|%Y|%a|%f|%p|%q|%t" 2>&1)
+exit_code=$?
+
+if [ "$exit_code" -ne 0 ]; then
+    echo -e "$raw_priority" >&2
+    exit "$exit_code"
+fi
+
+if [ -z "$raw_priority" ]; then
+    success "No pending jobs found in priority queues."
+    exit 0
+fi
+
+# Column widths
+W_ID=9
+W_NAME=16
+W_TOTAL=15
+W_AGE=8
+W_FAIR=12
+W_PART=11
+W_QOS=8
+W_TRES=8
+
+# Print Header
+hdr_id=$(pad_right "JOB ID" $W_ID)
+hdr_name=$(pad_right "JOB NAME" $W_NAME)
+hdr_total=$(pad_right "PRIORITY" $W_TOTAL)
+hdr_age=$(pad_right "AGE" $W_AGE)
+hdr_fair=$(pad_right "FAIRSHARE" $W_FAIR)
+hdr_part=$(pad_right "PARTITION" $W_PART)
+hdr_qos=$(pad_right "QOS" $W_QOS)
+hdr_tres="TRES/CPU"
+
+if [ -n "$STYLE_BOLD" ]; then
+    echo -e "${STYLE_BOLD}${COLOR_PRIMARY}${hdr_id} ${hdr_name} ${hdr_total} ${hdr_age} ${hdr_fair} ${hdr_part} ${hdr_qos} ${hdr_tres}${STYLE_RESET}"
+    echo -e "${CLR_GREY}$(pad_right "" 92 "-")${STYLE_RESET}"
+else
+    echo -e "${hdr_id} ${hdr_name} ${hdr_total} ${hdr_age} ${hdr_fair} ${hdr_part} ${hdr_qos} ${hdr_tres}"
+    echo -e "$(pad_right "" 92 "-")"
+fi
+
+# Process rows
+while IFS='|' read -r j_id j_name j_total j_age j_fair j_part j_qos j_tres; do
+    if [ -z "$j_id" ]; then continue; fi
+    
+    # Clean spacing
+    j_id=$(echo "$j_id" | tr -d ' ')
+    j_total=$(echo "$j_total" | tr -d ' ')
+    j_age=$(echo "$j_age" | tr -d ' ')
+    j_fair=$(echo "$j_fair" | tr -d ' ')
+    j_part=$(echo "$j_part" | tr -d ' ')
+    j_qos=$(echo "$j_qos" | tr -d ' ')
+    j_tres=$(echo "$j_tres" | tr -d ' ')
+    
+    # 1. Format Job ID & Name
+    f_id=$(pad_right "$j_id" $W_ID)
+    
+    if [ "${#j_name}" -gt $((W_NAME - 1)) ]; then
+        f_name="${j_name:0:$((W_NAME - 4))}..."
+    else
+        f_name="$j_name"
+    fi
+    f_name=$(pad_right "$f_name" $W_NAME)
+    
+    # 2. Identify the dominant priority factor
+    # Dominant factor will be highlighted in bright gold/yellow
+    max_factor=0
+    dominant_type=""
+    
+    if [ "$j_age" -gt "$max_factor" ]; then max_factor="$j_age"; dominant_type="age"; fi
+    if [ "$j_fair" -gt "$max_factor" ]; then max_factor="$j_fair"; dominant_type="fair"; fi
+    if [ "$j_part" -gt "$max_factor" ]; then max_factor="$j_part"; dominant_type="part"; fi
+    if [ "$j_qos" -gt "$max_factor" ]; then max_factor="$j_qos"; dominant_type="qos"; fi
+    if [ "$j_tres" -gt "$max_factor" ]; then max_factor="$j_tres"; dominant_type="tres"; fi
+    
+    # 3. Format factor strings, highlighting the dominant one if color is enabled
+    f_age="$j_age"
+    f_fair="$j_fair"
+    f_part="$j_part"
+    f_qos="$j_qos"
+    f_tres="$j_tres"
+    
+    if [ -n "$CLR_GOLD" ] && [ "$max_factor" -gt 0 ]; then
+        case "$dominant_type" in
+            age)  f_age="${STYLE_BOLD}${CLR_GOLD}${j_age}★${STYLE_RESET}" ;;
+            fair) f_fair="${STYLE_BOLD}${CLR_GOLD}${j_fair}★${STYLE_RESET}" ;;
+            part) f_part="${STYLE_BOLD}${CLR_GOLD}${j_part}★${STYLE_RESET}" ;;
+            qos)  f_qos="${STYLE_BOLD}${CLR_GOLD}${j_qos}★${STYLE_RESET}" ;;
+            tres) f_tres="${STYLE_BOLD}${CLR_GOLD}${j_tres}★${STYLE_RESET}" ;;
+        esac
+    fi
+    
+    # Pad factors
+    f_age=$(pad_right "$f_age" $W_AGE)
+    f_fair=$(pad_right "$f_fair" $W_FAIR)
+    f_part=$(pad_right "$f_part" $W_PART)
+    f_qos=$(pad_right "$f_qos" $W_QOS)
+    
+    # 4. Format Total Priority
+    f_total="$j_total"
+    if [ -n "$CLR_GREEN" ]; then
+        f_total="${STYLE_BOLD}${CLR_GREEN}${j_total}${STYLE_RESET}"
+    fi
+    f_total=$(pad_right "$f_total" $W_TOTAL)
+    
+    echo -e "${f_id} ${f_name} ${f_total} ${f_age} ${f_fair} ${f_part} ${f_qos} ${f_tres}"
+    
+done <<< "$raw_priority"

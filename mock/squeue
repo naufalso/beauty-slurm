@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: Mock squeue command
+# Simulates squeue CLI with filtering and robust format parsing capabilities.
+
+# Source mock cluster state
+MOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MOCK_DIR/cluster_state.sh"
+
+# Parse arguments
+FORMAT_STR=""
+FILTER_USER=""
+FILTER_JOB=""
+FILTER_STATE=""
+NO_HEADER=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --Format=*|--format=*)
+            FORMAT_STR="${1#*=}"
+            shift
+            ;;
+        -o|--Format|--format)
+            FORMAT_STR="$2"
+            shift 2
+            ;;
+        -u|--user)
+            FILTER_USER="$2"
+            shift 2
+            ;;
+        -u*)
+            FILTER_USER="${1#-u}"
+            shift
+            ;;
+        --user=*)
+            FILTER_USER="${1#*=}"
+            shift
+            ;;
+        -j|--jobs)
+            FILTER_JOB="$2"
+            shift 2
+            ;;
+        -j*)
+            FILTER_JOB="${1#-j}"
+            shift
+            ;;
+        --jobs=*)
+            FILTER_JOB="${1#*=}"
+            shift
+            ;;
+        -t|--states)
+            FILTER_STATE="$2"
+            shift 2
+            ;;
+        --states=*)
+            FILTER_STATE="${1#*=}"
+            shift
+            ;;
+        -h|--noheader)
+            NO_HEADER=1
+            shift
+            ;;
+        *)
+            # Ignore other flags for simplicity
+            shift
+            ;;
+    esac
+done
+
+# Set default format if none provided
+if [ -z "$FORMAT_STR" ]; then
+    FORMAT_STR="JOBID:%i,PARTITION:%P,NAME:%j,USER:%u,STATE:%T,TIME:%M,NODES:%D,NODELIST(REASON):%R"
+fi
+
+# Detect delimiter
+DELIM=","
+if [[ "$FORMAT_STR" == *"|"* ]]; then
+    DELIM="|"
+fi
+
+# Print header if not suppressed and not using raw custom output format without titles
+if [ "$NO_HEADER" -eq 0 ]; then
+    header_line=""
+    IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
+    for field in "${format_fields[@]}"; do
+        title="${field%%:*}"
+        if [ "$title" == "$field" ]; then
+            title="FIELD"
+        fi
+        title=$(echo "$title" | tr '[:lower:]' '[:upper:]')
+        if [ "$DELIM" == "|" ]; then
+            header_line="${header_line}${title}|"
+        else
+            header_line="${header_line}${title}\t"
+        fi
+    done
+    # Strip trailing delimiter
+    if [ "$DELIM" == "|" ]; then
+        header_line="${header_line%|}"
+        echo -e "$header_line"
+    else
+        echo -e "$header_line" | expand -t 20
+    fi
+fi
+
+# Loop through mock jobs and filter
+ALL_JOBS=("${MOCK_JOBS[@]}")
+if [ -f "$MOCK_DIR/.jobs_state" ]; then
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            ALL_JOBS+=("$line")
+        fi
+    done < "$MOCK_DIR/.jobs_state"
+fi
+
+for job_str in "${ALL_JOBS[@]}"; do
+    # Split job fields
+    IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount j_nlist j_cpus j_mem j_gres j_reason j_stdout j_stderr <<< "$job_str"
+    
+    # Apply filters
+    if [ -n "$FILTER_USER" ] && [ "$FILTER_USER" != "$j_user" ]; then
+        continue
+    fi
+    if [ -n "$FILTER_JOB" ] && [ "$FILTER_JOB" != "$j_id" ]; then
+        continue
+    fi
+    if [ -n "$FILTER_STATE" ] && [ "$FILTER_STATE" != "$j_state" ]; then
+        continue
+    fi
+    
+    # Format output line
+    output_line=""
+    IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
+    for field in "${format_fields[@]}"; do
+        token="$field"
+        if [[ "$field" == *":"* ]]; then
+            token="${field#*:}"
+        fi
+        
+        # Replace tokens
+        val=""
+        case "$token" in
+            %i) val="$j_id" ;;
+            %P) val="$j_part" ;;
+            %j) val="$j_name" ;;
+            %u) val="$j_user" ;;
+            %T|%t) val="$j_state" ;;
+            %M) val="$j_time" ;;
+            %l) val="$j_limit" ;;
+            %D) val="$j_ncount" ;;
+            %N) val="$j_nlist" ;;
+            %C) val="$j_cpus" ;;
+            %m) val="$j_mem" ;;
+            %b) val="$j_gres" ;;
+            %R) 
+                if [ "$j_state" == "PENDING" ]; then
+                    val="($j_reason)"
+                else
+                    val="$j_nlist"
+                fi
+                ;;
+            *) val="-" ;;
+        esac
+        
+        if [ "$DELIM" == "|" ]; then
+            output_line="${output_line}${val}|"
+        else
+            output_line="${output_line}${val}\t"
+        fi
+    done
+    
+    if [ "$DELIM" == "|" ]; then
+        output_line="${output_line%|}"
+        echo -e "$output_line"
+    else
+        output_line="${output_line%\\t}"
+        echo -e "$output_line" | expand -t 20
+    fi
+done

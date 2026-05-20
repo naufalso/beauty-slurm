@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: Mock sbatch command
+# Simulates job submission, script check, and spawns a background worker 
+# that generates real-time log output for sbatch-track tests.
+
+MOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Find the script name (usually the last argument)
+script_file=""
+for arg in "$@"; do
+    if [[ "$arg" != -* ]]; then
+        script_file="$arg"
+    fi
+done
+
+if [ -z "$script_file" ]; then
+    echo "sbatch: error: No script specified" >&2
+    exit 1
+fi
+
+if [ ! -f "$script_file" ]; then
+    echo "sbatch: error: Script file '$script_file' not found" >&2
+    exit 1
+fi
+
+# Parse options
+std_out=""
+std_err=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)
+            std_out="$2"
+            shift 2
+            ;;
+        --output=*)
+            std_out="${1#*=}"
+            shift
+            ;;
+        -e|--error)
+            std_err="$2"
+            shift 2
+            ;;
+        --error=*)
+            std_err="${1#*=}"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Check script directives if not specified on CLI
+if [ -z "$std_out" ] && [ -f "$script_file" ]; then
+    directive=$(grep -E "^#SBATCH[[:space:]]+(-o|--output)" "$script_file")
+    if [ -n "$directive" ]; then
+        std_out=$(echo "$directive" | sed -E 's/^#SBATCH[[:space:]]+(-o|--output)=?[[:space:]]*//' | tr -d '"' | tr -d "'")
+    fi
+fi
+
+if [ -z "$std_err" ] && [ -f "$script_file" ]; then
+    directive=$(grep -E "^#SBATCH[[:space:]]+(-e|--error)" "$script_file")
+    if [ -n "$directive" ]; then
+        std_err=$(echo "$directive" | sed -E 's/^#SBATCH[[:space:]]+(-e|--error)=?[[:space:]]*//' | tr -d '"' | tr -d "'")
+    fi
+fi
+
+# Generate a new mock Job ID
+JOB_ID=$((100000 + RANDOM % 900000))
+
+# Standard SLURM defaults if not specified anywhere
+job_name=$(basename "$script_file" | cut -d. -f1)
+if [ -z "$std_out" ]; then
+    std_out="slurm-$JOB_ID.out"
+else
+    # Replace SLURM replacement strings %j and %x
+    std_out=$(echo "$std_out" | sed "s/%j/$JOB_ID/g; s/%x/$job_name/g")
+fi
+
+if [ -z "$std_err" ]; then
+    std_err="$std_out"
+else
+    std_err=$(echo "$std_err" | sed "s/%j/$JOB_ID/g; s/%x/$job_name/g")
+fi
+
+# Print standard SLURM submission response
+echo "Submitted batch job $JOB_ID"
+
+# Create directories for logs if needed
+log_out_dir=$(dirname "$std_out")
+if [[ "$log_out_dir" != "." && ! -d "$log_out_dir" ]]; then
+    mkdir -p "$log_out_dir"
+fi
+
+log_err_dir=$(dirname "$std_err")
+if [[ "$log_err_dir" != "." && ! -d "$log_err_dir" ]]; then
+    mkdir -p "$log_err_dir"
+fi
+
+# Append to local jobs state
+# Format: JobID | Partition | Name | User | State | TimeUsed | TimeLimit | NodeCount | NodeList | CPUs | Memory | GRES | Reason | StdOut | StdErr
+echo "$JOB_ID|gpu|$job_name|naufalsuryanto|PENDING|00:00:00|24:00:00|1|gnode03|4|16G|gpu:v100:1|None|$std_out|$std_err" >> "$MOCK_DIR/.jobs_state"
+
+# Spawn a background simulator to generate realistic log outputs in real-time
+(
+    # Helper to update dynamic job state
+    update_mock_job_state() {
+        local new_state="$1"
+        local new_time="$2"
+        if [ -f "$MOCK_DIR/.jobs_state" ]; then
+            local temp_file="$MOCK_DIR/.jobs_state.tmp"
+            while IFS= read -r line; do
+                IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount j_nlist j_cpus j_mem j_gres j_reason j_stdout j_stderr <<< "$line"
+                if [ "$j_id" == "$JOB_ID" ]; then
+                    echo "$JOB_ID|$j_part|$j_name|$j_user|$new_state|$new_time|$j_limit|$j_ncount|$j_nlist|$j_cpus|$j_mem|$j_gres|$j_reason|$j_stdout|$j_stderr"
+                else
+                    echo "$line"
+                fi
+            done < "$MOCK_DIR/.jobs_state" > "$temp_file"
+            mv "$temp_file" "$MOCK_DIR/.jobs_state"
+        fi
+    }
+
+    # Wait 2 seconds in PENDING state
+    sleep 2
+    
+    # Transition to RUNNING
+    update_mock_job_state "RUNNING" "00:00:01"
+    
+    # Write starting message
+    echo "=== SLURM Job $JOB_ID Started ===" > "$std_out"
+    echo "Node: gnode03" >> "$std_out"
+    echo "Partition: gpu" >> "$std_out"
+    echo "User: naufalsuryanto" >> "$std_out"
+    echo "Date: $(date)" >> "$std_out"
+    echo "" >> "$std_out"
+    
+    if [ "$std_out" != "$std_err" ]; then
+        echo "[INFO] CUDA initialized successfully. Device 0: NVIDIA Tesla V100" > "$std_err"
+    fi
+    sleep 1
+    
+    update_mock_job_state "RUNNING" "00:00:02"
+    echo "[1/4] Loading CUDA and Anaconda environments..." >> "$std_out"
+    if [ "$std_out" != "$std_err" ]; then
+        echo "[WARNING] UserWarning: PyTorch was compiled without GPU support in some packages, using fallback." >> "$std_err"
+    fi
+    sleep 1
+    
+    update_mock_job_state "RUNNING" "00:00:03"
+    echo "[2/4] Initializing deep learning model..." >> "$std_out"
+    if [ "$std_out" != "$std_err" ]; then
+        echo "[INFO] Model parameters: 110M" >> "$std_err"
+    fi
+    sleep 1.5
+    
+    update_mock_job_state "RUNNING" "00:00:05"
+    echo "[3/4] Running model training loop..." >> "$std_out"
+    sleep 0.5
+    
+    for epoch in {1..3}; do
+        echo "      Epoch $epoch/3 | loss: $((RANDOM % 100)).$((RANDOM % 99)) | acc: 0.$((80 + RANDOM % 19))" >> "$std_out"
+        if [ "$std_out" != "$std_err" ]; then
+            echo "[INFO] Epoch $epoch completed in 1.5s" >> "$std_err"
+        fi
+        sleep 1.5
+        update_mock_job_state "RUNNING" "00:00:$((5 + epoch * 2))"
+    done
+    
+    echo "[4/4] Saving model weights to './model_weights.pt'..." >> "$std_out"
+    sleep 1
+    
+    update_mock_job_state "RUNNING" "00:00:12"
+    echo "=== SLURM Job $JOB_ID Finished Successfully ===" >> "$std_out"
+    echo "Exit Code: 0" >> "$std_out"
+    if [ "$std_out" != "$std_err" ]; then
+        echo "[INFO] Model checkpoint saved to './model_weights.pt'" >> "$std_err"
+    fi
+    
+    # Transition to COMPLETED
+    update_mock_job_state "COMPLETED" "00:00:13"
+) & disown

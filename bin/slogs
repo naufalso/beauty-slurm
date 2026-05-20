@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: slogs (Smart Log Streamer)
+# Automatically streams/tails the log output of running SLURM jobs by their index.
+
+# Source library files
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$BIN_DIR")"
+
+if [ -f "$BASE_DIR/lib/core.sh" ]; then
+    source "$BASE_DIR/lib/core.sh"
+    source "$BASE_DIR/lib/slurm_api.sh"
+else
+    echo "Error: Core libraries not found." >&2
+    exit 1
+fi
+
+show_help() {
+    cat <<EOF
+${CLR_PURPLE}${STYLE_BOLD}Beauty SLURM: slogs${STYLE_RESET} (Smart Log Streamer)
+
+Streams the log files of running jobs using ${CLR_CYAN}tail -f${STYLE_RESET}.
+
+${STYLE_BOLD}Usage:${STYLE_RESET} slogs [index] [options]
+
+${STYLE_BOLD}Options:${STYLE_RESET}
+  [index]          The 0-based index of the running job (sorted from earliest running Job ID)
+  --color=VAL      Force color modes: auto (default), always, never
+  --mock           Force local mocking layer (for offline testing)
+  -h, --help       Show this help message
+
+If no index is provided, slogs will display the list of all running jobs with their indices.
+
+${STYLE_BOLD}Examples:${STYLE_RESET}
+  slogs            Show the numbered list of your currently running jobs
+  slogs 0          Tail the logs of your earliest running job
+EOF
+    exit 0
+}
+
+# Check for help
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        show_help
+    fi
+done
+
+# Parse global flags
+# We extract any positional args (like the index) while separating out global options
+INDEX=""
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --color=*|--mock)
+            # Will be parsed by parse_global_flags below
+            args+=("$1")
+            shift
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]] && [ -z "$INDEX" ]; then
+                INDEX="$1"
+            else
+                args+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Restore and parse global flags
+set -- "${args[@]}"
+parse_global_flags "$@"
+
+# Initialize SLURM environment
+bootstrap_slurm_environment
+
+# Fetch currently running jobs of the current user, sorted by earliest running Job ID (ascending order)
+raw_running=$(squeue -u "$USER" -h -t RUNNING -o "%i|%j|%P|%T|%M" 2>/dev/null | sort -t'|' -k1 -n)
+
+# Read jobs into an array
+jobs_arr=()
+if [ -n "$raw_running" ]; then
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            jobs_arr+=("$line")
+        fi
+    done <<< "$raw_running"
+fi
+
+num_jobs=${#jobs_arr[@]}
+
+# If no index is presented, show the list of running jobs
+if [ -z "$INDEX" ]; then
+    if [ "$num_jobs" -eq 0 ]; then
+        success "No running jobs found for user ${CLR_GREEN}$USER${STYLE_RESET}."
+        exit 0
+    fi
+    
+    echo -e "${CLR_PURPLE}${STYLE_BOLD}Active Running Jobs for ${CLR_GREEN}$USER${CLR_PURPLE}:${STYLE_RESET}"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    
+    for ((i=0; i<num_jobs; i++)); do
+        IFS='|' read -r j_id j_name j_part j_state j_time <<< "${jobs_arr[$i]}"
+        # Format index, Job ID, Name, Partition, State, Time
+        # E.g., "0: 100234 train_bert (gpu) RUNNING 12:34:56"
+        idx_str="${CLR_YELLOW}${i}${STYLE_RESET}"
+        id_str="${CLR_PURPLE}${j_id}${STYLE_RESET}"
+        name_str="${CLR_CYAN}${j_name}${STYLE_RESET}"
+        part_str="${CLR_GREY}(${j_part})${STYLE_RESET}"
+        state_str="${CLR_GREEN}${j_state}${STYLE_RESET}"
+        time_str="${CLR_YELLOW}${j_time}${STYLE_RESET}"
+        
+        echo -e "${idx_str}: ${id_str} ${name_str} ${part_str} ${state_str} ${time_str}"
+    done
+    
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    echo -e "To tail logs for a job, run: ${CLR_CYAN}slogs <index>${STYLE_RESET}"
+    exit 0
+fi
+
+# Validate index
+if ! [[ "$INDEX" =~ ^[0-9]+$ ]] || [ "$INDEX" -lt 0 ] || [ "$INDEX" -ge "$num_jobs" ]; then
+    error "Invalid or out-of-bounds index: '$INDEX'."
+    echo "Please specify a number between 0 and $((num_jobs - 1))." >&2
+    exit 1
+fi
+
+# Get Job details for target index
+IFS='|' read -r target_id target_name target_part target_state target_time <<< "${jobs_arr[$INDEX]}"
+
+info "Resolving log files for Job ID: ${CLR_PURPLE}${target_id}${STYLE_RESET} (${CLR_CYAN}${target_name}${STYLE_RESET})..."
+
+# Fetch log paths using slurm api helper
+log_files=()
+while IFS= read -r line; do
+    log_files+=("$line")
+done < <(get_job_log_files "$target_id")
+
+log_out="${log_files[0]}"
+log_err="${log_files[1]}"
+
+if [ -z "$log_out" ]; then
+    error "StdOut log path could not be resolved from scheduler."
+    exit 1
+fi
+
+# Touch files to ensure they exist
+touch "$log_out" 2>/dev/null
+if [[ -n "$log_err" && "$log_err" != "$log_out" ]]; then
+    touch "$log_err" 2>/dev/null
+    info "Streaming StdOut: ${CLR_CYAN}${log_out}${STYLE_RESET}"
+    info "Streaming StdErr: ${CLR_RED}${log_err}${STYLE_RESET}"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    tail -f "$log_out" "$log_err"
+else
+    info "Streaming output log: ${CLR_CYAN}${log_out}${STYLE_RESET}"
+    echo -e "${CLR_GREY}------------------------------------------------------------------------${STYLE_RESET}"
+    tail -f "$log_out"
+fi

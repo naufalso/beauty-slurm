@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+
+# beauty-slurm: Mock sinfo command
+# Simulates sinfo CLI with robust format token mapping for partition/node summary.
+
+MOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MOCK_DIR/cluster_state.sh"
+
+FORMAT_STR=""
+NO_HEADER=0
+NODE_MODE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --Format=*|--format=*)
+            FORMAT_STR="${1#*=}"
+            shift
+            ;;
+        -o|--Format|--format)
+            FORMAT_STR="$2"
+            shift 2
+            ;;
+        -h|--noheader)
+            NO_HEADER=1
+            shift
+            ;;
+        -N|--Node|--node)
+            NODE_MODE=1
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Set default format if none provided
+if [ -z "$FORMAT_STR" ]; then
+    FORMAT_STR="PARTITION:%P,AVAIL:%a,TIMELIMIT:%l,NODES(A/I/O/T):%F,CPUS(A/I/O/T):%C,NODELIST:%N"
+fi
+
+# Detect delimiter
+DELIM=","
+if [[ "$FORMAT_STR" == *"|"* ]]; then
+    DELIM="|"
+fi
+
+# Print header if not suppressed
+if [ "$NO_HEADER" -eq 0 ]; then
+    header_line=""
+    IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
+    for field in "${format_fields[@]}"; do
+        title="${field%%:*}"
+        if [ "$title" == "$field" ]; then
+            title="FIELD"
+        fi
+        title=$(echo "$title" | tr '[:lower:]' '[:upper:]')
+        if [ "$DELIM" == "|" ]; then
+            header_line="${header_line}${title}|"
+        else
+            header_line="${header_line}${title}\t"
+        fi
+    done
+    # Strip trailing delimiter
+    if [ "$DELIM" == "|" ]; then
+        header_line="${header_line%|}"
+        echo -e "$header_line"
+    else
+        echo -e "$header_line" | expand -t 20
+    fi
+fi
+
+if [ "$NODE_MODE" -eq 1 ]; then
+    # Loop through mock nodes
+    for node_str in "${MOCK_NODES[@]}"; do
+        # Format: Name | State | CPUs(Alloc/Total) | MemAlloc/Total(MB) | GRES | Reason(if Down/Drain)
+        IFS='|' read -r n_name n_state n_cpus n_mem n_gres n_reason <<< "$node_str"
+        
+        # Determine partition name based on prefix
+        n_part="unknown"
+        if [[ "$n_name" == gnode* ]]; then
+            n_part="gpu"
+        elif [[ "$n_name" == memnode* ]]; then
+            n_part="highmem"
+        elif [[ "$n_name" == node* ]]; then
+            n_part="compute"
+        fi
+        
+        output_line=""
+        IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
+        for field in "${format_fields[@]}"; do
+            token="$field"
+            if [[ "$field" == *":"* ]]; then
+                token="${field#*:}"
+            fi
+            
+            val=""
+            case "$token" in
+                %P) val="$n_part" ;;
+                %G) val="$n_gres" ;;
+                %n) val="$n_name" ;;
+                %t) 
+                    # Compact state (alloc, idle, down, mixed, drain)
+                    val=$(echo "$n_state" | tr '[:upper:]' '[:lower:]')
+                    if [ "$val" == "allocated" ]; then val="alloc"; fi
+                    ;;
+                %T) val="$n_state" ;;
+                %C) val="$n_cpus" ;;
+                %m) val="$n_mem" ;;
+                %E) val="$n_reason" ;;
+                *) val="-" ;;
+            esac
+            
+            if [ "$DELIM" == "|" ]; then
+                output_line="${output_line}${val}|"
+            else
+                output_line="${output_line}${val}\t"
+            fi
+        done
+        
+        if [ "$DELIM" == "|" ]; then
+            output_line="${output_line%|}"
+            echo -e "$output_line"
+        else
+            output_line="${output_line%\\t}"
+            echo -e "$output_line" | expand -t 20
+        fi
+    done
+else
+    # Loop through mock partitions
+    for part_str in "${MOCK_PARTITIONS[@]}"; do
+        # Format: Name | State | TimeLimit | Nodes(Alloc/Idle/Down/Total) | CPUs(Alloc/Idle/Other/Total) | NodesList
+        IFS='|' read -r p_name p_state p_limit p_nodes p_cpus p_nlist <<< "$part_str"
+        
+        # Calculate simple total node count from breakdown
+        total_nodes=$(echo "$p_nodes" | cut -d/ -f4)
+        
+        # Format output line
+        output_line=""
+        IFS="$DELIM" read -r -a format_fields <<< "$FORMAT_STR"
+        for field in "${format_fields[@]}"; do
+            token="$field"
+            if [[ "$field" == *":"* ]]; then
+                token="${field#*:}"
+            fi
+            
+            val=""
+            case "$token" in
+                %P) val="$p_name" ;;
+                %a) val="$p_state" ;;
+                %l) val="$p_limit" ;;
+                %D) val="$total_nodes" ;;
+                %F) val="$p_nodes" ;;
+                %C) val="$p_cpus" ;;
+                %N) val="$p_nlist" ;;
+                *) val="-" ;;
+            esac
+            
+            if [ "$DELIM" == "|" ]; then
+                output_line="${output_line}${val}|"
+            else
+                output_line="${output_line}${val}\t"
+            fi
+        done
+        
+        if [ "$DELIM" == "|" ]; then
+            output_line="${output_line%|}"
+            echo -e "$output_line"
+        else
+            output_line="${output_line%\\t}"
+            echo -e "$output_line" | expand -t 20
+        fi
+    done
+fi
