@@ -120,7 +120,7 @@ W_NAME=16
 W_USER=12
 W_STATE=12
 W_TIME=17
-W_RES=16
+W_RES=20
 W_SUBMIT=13
 W_START=13
 
@@ -140,18 +140,18 @@ hdr_node="NODELIST / PENDING REASON"
 if [ -n "$STYLE_BOLD" ]; then
     if [ "$WIDE_MODE" -eq 1 ]; then
         echo -e "${STYLE_BOLD}${COLOR_PRIMARY}${hdr_id} ${hdr_part} ${hdr_name} ${hdr_user} ${hdr_state} ${hdr_time} ${hdr_res} ${hdr_submit} ${hdr_start} ${hdr_node}${STYLE_RESET}"
-        echo -e "${CLR_GREY}$(pad_right "" 142 "-")${STYLE_RESET}"
+        echo -e "${CLR_GREY}$(pad_right "" 146 "-")${STYLE_RESET}"
     else
         echo -e "${STYLE_BOLD}${COLOR_PRIMARY}${hdr_id} ${hdr_part} ${hdr_name} ${hdr_user} ${hdr_state} ${hdr_time} ${hdr_res} ${hdr_node}${STYLE_RESET}"
-        echo -e "${CLR_GREY}$(pad_right "" 115 "-")${STYLE_RESET}"
+        echo -e "${CLR_GREY}$(pad_right "" 119 "-")${STYLE_RESET}"
     fi
 else
     if [ "$WIDE_MODE" -eq 1 ]; then
         echo -e "${hdr_id} ${hdr_part} ${hdr_name} ${hdr_user} ${hdr_state} ${hdr_time} ${hdr_res} ${hdr_submit} ${hdr_start} ${hdr_node}"
-        echo -e "$(pad_right "" 142 "-")"
+        echo -e "$(pad_right "" 146 "-")"
     else
         echo -e "${hdr_id} ${hdr_part} ${hdr_name} ${hdr_user} ${hdr_state} ${hdr_time} ${hdr_res} ${hdr_node}"
-        echo -e "$(pad_right "" 115 "-")"
+        echo -e "$(pad_right "" 119 "-")"
     fi
 fi
 
@@ -221,10 +221,18 @@ while IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount 
     gpu_prettified=$(parse_gres "$j_gres")
     f_res=""
     if [ -n "$gpu_prettified" ]; then
+        mem_gb=$(parse_memory_to_gb "$j_mem")
+        gpu_part=""
         if [ -n "$CLR_ORANGE" ]; then
-            f_res="${STYLE_BOLD}${CLR_ORANGE}${ICON_GPU} ${gpu_prettified}${STYLE_RESET}"
+            gpu_part="${STYLE_BOLD}${CLR_ORANGE}${ICON_GPU} ${gpu_prettified}${STYLE_RESET}"
         else
-            f_res="${ICON_GPU} ${gpu_prettified}"
+            gpu_part="${ICON_GPU} ${gpu_prettified}"
+        fi
+
+        if [ "$mem_gb" -gt 0 ]; then
+            f_res="${j_cpus}c/${mem_gb}G/${gpu_part}"
+        else
+            f_res="${j_cpus}c/${gpu_part}"
         fi
     else
         mem_gb=$(parse_memory_to_gb "$j_mem")
