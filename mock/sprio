@@ -82,12 +82,21 @@ for job_str in "${MOCK_JOBS[@]}"; do
     fi
     
     # Generate deterministic priority factors based on job IDs
-    age_factor=$(( (j_id % 3) * 350 + 120 ))
-    fair_factor=$(( (j_id % 5) * 800 + 400 ))
-    part_factor=100
-    qos_factor=$(( (j_id % 2) * 2000 + 1000 ))
-    tres_factor=$(( j_cpus * 50 ))
-    total_priority=$(( age_factor + fair_factor + part_factor + qos_factor + tres_factor + 1000 ))
+    if [ "$j_id" -eq 100239 ]; then
+        age_factor="0.0030456"
+        fair_factor="0.0000030"
+        part_factor="1.0000000"
+        qos_factor="0.0000000"
+        tres_factor=""
+        total_priority="1.0030486"
+    else
+        age_factor=$(( (j_id % 3) * 350 + 120 ))
+        fair_factor=$(( (j_id % 5) * 800 + 400 ))
+        part_factor=100
+        qos_factor=$(( (j_id % 2) * 2000 + 1000 ))
+        tres_factor=$(( j_cpus * 50 ))
+        total_priority=$(( age_factor + fair_factor + part_factor + qos_factor + tres_factor + 1000 ))
+    fi
     
     # Format line
     output_line=""

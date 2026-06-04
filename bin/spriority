@@ -155,14 +155,29 @@ while IFS='|' read -r j_id j_name j_total j_age j_fair j_part j_qos j_tres; do
     
     # 2. Identify the dominant priority factor
     # Dominant factor will be highlighted in bright gold/yellow
-    max_factor=0
-    dominant_type=""
-    
-    if [ "$j_age" -gt "$max_factor" ]; then max_factor="$j_age"; dominant_type="age"; fi
-    if [ "$j_fair" -gt "$max_factor" ]; then max_factor="$j_fair"; dominant_type="fair"; fi
-    if [ "$j_part" -gt "$max_factor" ]; then max_factor="$j_part"; dominant_type="part"; fi
-    if [ "$j_qos" -gt "$max_factor" ]; then max_factor="$j_qos"; dominant_type="qos"; fi
-    if [ "$j_tres" -gt "$max_factor" ]; then max_factor="$j_tres"; dominant_type="tres"; fi
+    # Use awk to handle floating-point comparison safely and default empty/invalid values to 0
+    read -r max_factor dominant_type <<< $(awk -v age="${j_age:-0}" \
+                                               -v fair="${j_fair:-0}" \
+                                               -v part="${j_part:-0}" \
+                                               -v qos="${j_qos:-0}" \
+                                               -v tres="${j_tres:-0}" \
+                                               'BEGIN {
+                                                   max_val = 0;
+                                                   dom = "";
+                                                   age = age + 0;
+                                                   fair = fair + 0;
+                                                   part = part + 0;
+                                                   qos = qos + 0;
+                                                   tres = tres + 0;
+                                                   
+                                                   if (age > max_val) { max_val = age; dom = "age"; }
+                                                   if (fair > max_val) { max_val = fair; dom = "fair"; }
+                                                   if (part > max_val) { max_val = part; dom = "part"; }
+                                                   if (qos > max_val) { max_val = qos; dom = "qos"; }
+                                                   if (tres > max_val) { max_val = tres; dom = "tres"; }
+                                                   
+                                                   print max_val, dom;
+                                               }')
     
     # 3. Format factor strings, highlighting the dominant one if color is enabled
     f_age="$j_age"
@@ -171,7 +186,7 @@ while IFS='|' read -r j_id j_name j_total j_age j_fair j_part j_qos j_tres; do
     f_qos="$j_qos"
     f_tres="$j_tres"
     
-    if [ -n "$CLR_GOLD" ] && [ "$max_factor" -gt 0 ]; then
+    if [ -n "$CLR_GOLD" ] && [ -n "$dominant_type" ]; then
         case "$dominant_type" in
             age)  f_age="${STYLE_BOLD}${CLR_GOLD}${j_age}★${STYLE_RESET}" ;;
             fair) f_fair="${STYLE_BOLD}${CLR_GOLD}${j_fair}★${STYLE_RESET}" ;;
