@@ -25,14 +25,17 @@ Beautified replacement for standard ${CLR_CYAN}sinfo${STYLE_RESET} command.
 ${STYLE_BOLD}Usage:${STYLE_RESET} scluster [options]
 
 ${STYLE_BOLD}Options:${STYLE_RESET}
-  --color=VAL      Force color modes: auto (default), always, never
-  --mock           Force local mocking layer (for offline testing)
-  -h, --help       Show this help message
+  --free[=PARTITION] Show detailed breakdown of free GPUs, CPUs, and memory on nodes in the partition (default: gpu)
+  --color=VAL        Force color modes: auto (default), always, never
+  --mock             Force local mocking layer (for offline testing)
+  -h, --help         Show this help message
 
 All other flags and arguments are directly forwarded to ${CLR_CYAN}sinfo${STYLE_RESET}.
 
 ${STYLE_BOLD}Examples:${STYLE_RESET}
   scluster
+  scluster --free
+  scluster --free=gpu
   scluster --color=always
 EOF
     exit 0
@@ -50,10 +53,26 @@ parse_global_flags "$@"
 bootstrap_slurm_environment
 
 # Forwarded options
+SHOW_FREE=0
+FREE_PARTITION="gpu"
 SINFO_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --color=*|--mock)
+            shift
+            ;;
+        --free)
+            SHOW_FREE=1
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                FREE_PARTITION="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --free=*)
+            SHOW_FREE=1
+            FREE_PARTITION="${1#*=}"
             shift
             ;;
         *)
@@ -62,6 +81,201 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ "${SHOW_FREE:-0}" -eq 1 ]; then
+    # Fetch nodes details using scontrol show nodes -o
+    raw_nodes=$(scontrol show nodes -o 2>&1)
+    exit_code=$?
+    
+    if [ "$exit_code" -ne 0 ]; then
+        error "Failed to fetch node details: $raw_nodes"
+        exit "$exit_code"
+    fi
+    
+    # Process nodes with awk to extract free resources
+    parsed_free_nodes=$(echo "$raw_nodes" | awk -v partition="${FREE_PARTITION}" '
+    function field_value(line, key,    regex, val, idx) {
+        regex = "(^|[[:space:]])" key "=[^[:space:]]+"
+        if (match(line, regex)) {
+            val = substr(line, RSTART, RLENGTH)
+            sub(/^[[:space:]]*/, "", val)
+            idx = index(val, "=")
+            if (idx > 0) {
+                return substr(val, idx + 1)
+            }
+        }
+        return ""
+    }
+
+    function tres_value(tres, key,    parts, kv, i) {
+        split(tres, parts, ",")
+        for (i = 1; i <= length(parts); i++) {
+            split(parts[i], kv, "=")
+            if (kv[1] == key) {
+                return kv[2]
+            }
+        }
+        return 0
+    }
+
+    function mem_to_gib(mem,    n, unit) {
+        if (mem == "" || mem == 0) {
+            return 0
+        }
+
+        n = mem + 0
+        unit = substr(mem, length(mem), 1)
+
+        if (unit == "T") {
+            return n * 1024
+        }
+        if (unit == "G") {
+            return n
+        }
+        if (unit == "M") {
+            return n / 1024
+        }
+        if (unit == "K") {
+            return n / 1024 / 1024
+        }
+
+        return n / 1024
+    }
+
+    {
+        node = field_value($0, "NodeName")
+        partitions = field_value($0, "Partitions")
+        gres = field_value($0, "Gres")
+        cfg_tres = field_value($0, "CfgTRES")
+        alloc_tres = field_value($0, "AllocTRES")
+
+        if (node == "" || gres !~ /gpu/ || partitions !~ "(^|,)" partition "(,|$)") {
+            next
+        }
+
+        cfg_gpu = tres_value(cfg_tres, "gres/gpu")
+        alloc_gpu = tres_value(alloc_tres, "gres/gpu")
+        cfg_cpu = tres_value(cfg_tres, "cpu")
+        alloc_cpu = tres_value(alloc_tres, "cpu")
+        cfg_mem = mem_to_gib(tres_value(cfg_tres, "mem"))
+        alloc_mem = mem_to_gib(tres_value(alloc_tres, "mem"))
+
+        free_gpu = cfg_gpu - alloc_gpu
+        free_cpu = cfg_cpu - alloc_cpu
+        free_mem = cfg_mem - alloc_mem
+
+        if (free_gpu < 0) free_gpu = 0
+        if (free_cpu < 0) free_cpu = 0
+        if (free_mem < 0) free_mem = 0
+
+        if (free_gpu > 0) {
+            printf "%s|%d|%d|%.2f\n", node, free_gpu, free_cpu, free_mem
+        }
+    }
+    ')
+    
+    # Check if we have any free nodes
+    if [ -z "$parsed_free_nodes" ]; then
+        if [ -n "$STYLE_BOLD" ]; then
+            echo -e "${STYLE_BOLD}${COLOR_PRIMARY}FREE GPU RESOURCES BREAKDOWN (Partition: ${FREE_PARTITION})${STYLE_RESET}"
+            echo -e "${CLR_GREY}$(pad_right "" 70 "-")${STYLE_RESET}"
+        else
+            echo -e "FREE GPU RESOURCES BREAKDOWN (Partition: ${FREE_PARTITION})"
+            echo -e "$(pad_right "" 70 "-")"
+        fi
+        warn "No nodes with free GPUs found in partition '${FREE_PARTITION}'."
+        exit 0
+    fi
+    
+    # Define widths for columns
+    W_NODE=15
+    W_FGPU=18
+    W_FCPU=18
+    W_FMEM=18
+    
+    # Format memory function using awk
+    format_mem_gib() {
+        local gib="$1"
+        awk -v g="$gib" 'BEGIN {
+            if (g < 1024) {
+                printf "~%.0fGB", g
+            } else {
+                printf "~%.1fTB", g / 1024
+            }
+        }'
+    }
+    
+    # Print table header
+    hdr_node=$(pad_right "NODE" $W_NODE)
+    hdr_fgpu=$(pad_right "FREE GPUS" $W_FGPU)
+    hdr_fcpu=$(pad_right "FREE CPUS" $W_FCPU)
+    hdr_fmem=$(pad_right "FREE MEMORY" $W_FMEM)
+    
+    if [ -n "$STYLE_BOLD" ]; then
+        echo -e "${STYLE_BOLD}${COLOR_PRIMARY}FREE GPU RESOURCES BREAKDOWN (Partition: ${FREE_PARTITION})${STYLE_RESET}"
+        echo -e "${STYLE_BOLD}${COLOR_PRIMARY}${hdr_node} ${hdr_fgpu} ${hdr_fcpu} ${hdr_fmem}${STYLE_RESET}"
+        echo -e "${CLR_GREY}$(pad_right "" 70 "-")${STYLE_RESET}"
+    else
+        echo -e "FREE GPU RESOURCES BREAKDOWN (Partition: ${FREE_PARTITION})"
+        echo -e "${hdr_node} ${hdr_fgpu} ${hdr_fcpu} ${hdr_fmem}"
+        echo -e "$(pad_right "" 70 "-")"
+    fi
+    
+    total_free_gpus=0
+    total_free_cpus=0
+    total_free_mem=0
+    
+    # Read line by line and print beautifully
+    while IFS='|' read -r node f_gpu f_cpu f_mem; do
+        if [ -z "$node" ]; then continue; fi
+        
+        # Accumulate totals
+        total_free_gpus=$((total_free_gpus + f_gpu))
+        total_free_cpus=$((total_free_cpus + f_cpu))
+        total_free_mem=$(awk -v t="$total_free_mem" -v m="$f_mem" 'BEGIN { print t + m }')
+        
+        f_mem_formatted=$(format_mem_gib "$f_mem")
+        
+        # Prepare layout elements
+        if [ -n "$CLR_CYAN" ]; then
+            # Color active
+            col_node=$(pad_right "${CLR_CYAN}${node}${STYLE_RESET}" $W_NODE)
+            col_gpu=$(pad_right "${CLR_ORANGE}${ICON_GPU} ${f_gpu} free${STYLE_RESET}" $W_FGPU)
+            col_cpu=$(pad_right "${CLR_GREEN}${ICON_CPU} ${f_cpu} free${STYLE_RESET}" $W_FCPU)
+            col_mem=$(pad_right "${CLR_TEAL}${ICON_MEM} ${f_mem_formatted} free${STYLE_RESET}" $W_FMEM)
+        else
+            # No color
+            col_node=$(pad_right "${node}" $W_NODE)
+            col_gpu=$(pad_right "${ICON_GPU} ${f_gpu} free" $W_FGPU)
+            col_cpu=$(pad_right "${ICON_CPU} ${f_cpu} free" $W_FCPU)
+            col_mem=$(pad_right "${ICON_MEM} ${f_mem_formatted} free" $W_FMEM)
+        fi
+        
+        echo -e "${col_node} ${col_gpu} ${col_cpu} ${col_mem}"
+    done <<< "$parsed_free_nodes"
+    
+    # Print footer and totals
+    total_mem_formatted=$(format_mem_gib "$total_free_mem")
+    
+    if [ -n "$STYLE_BOLD" ]; then
+        echo -e "${CLR_GREY}$(pad_right "" 70 "-")${STYLE_RESET}"
+        # Sum row
+        summary_label=$(pad_right "${STYLE_BOLD}TOTAL FREE${STYLE_RESET}" $W_NODE)
+        summary_gpu=$(pad_right "${STYLE_BOLD}${CLR_ORANGE}${ICON_GPU} ${total_free_gpus} free${STYLE_RESET}" $W_FGPU)
+        summary_cpu=$(pad_right "${STYLE_BOLD}${CLR_GREEN}${ICON_CPU} ${total_free_cpus} free${STYLE_RESET}" $W_FCPU)
+        summary_mem=$(pad_right "${STYLE_BOLD}${CLR_TEAL}${ICON_MEM} ${total_mem_formatted} free${STYLE_RESET}" $W_FMEM)
+        echo -e "${summary_label} ${summary_gpu} ${summary_cpu} ${summary_mem}"
+    else
+        echo -e "$(pad_right "" 70 "-")"
+        summary_label=$(pad_right "TOTAL FREE" $W_NODE)
+        summary_gpu=$(pad_right "${ICON_GPU} ${total_free_gpus} free" $W_FGPU)
+        summary_cpu=$(pad_right "${ICON_CPU} ${total_free_cpus} free" $W_FCPU)
+        summary_mem=$(pad_right "${ICON_MEM} ${total_mem_formatted} free" $W_FMEM)
+        echo -e "${summary_label} ${summary_gpu} ${summary_cpu} ${summary_mem}"
+    fi
+    
+    exit 0
+fi
 
 # 1. Fetch partition details
 # Format: Name | State | TimeLimit | Nodes(A/I/O/T) | CPUs(A/I/O/T) | NodesList

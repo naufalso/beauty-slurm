@@ -18,11 +18,13 @@ Beauty SLURM transforms cryptic, truncated, and monochrome text outputs into hig
 ### 2. `scluster` (Cluster Status Dashboard) — *Wraps `sinfo`*
 *   **Resource Utilization Bars**: Graphical progress bars showing CPU and node occupancy: `[██████░░░░] 60% Allocated`.
 *   **GPU Inventory Auditing**: Summarizes exact GPU inventory per partition (e.g. `⚡ 6/16 A100 Free` vs. all cards occupied) by inspecting physical node configurations and active job demands.
+*   **Free GPU Resource Breakdown (`--free[=PARTITION]`)**: Displays a detailed, colorized breakdown of available resources (GPUs, CPUs, memory) on active nodes with free GPUs in the specified partition (defaults to `gpu`). Also shows total free resources in a summary row.
 *   **Clean Outlines**: Overview of max walltimes, partition online states, and grouped node-lists.
 
 ### 3. `sbatch-track` (Interactive Submitter & Log Tracker) — *Wraps `sbatch`*
-*   **Pre-Flight Script Linter**: Scans scripts before submission. Warns about missing shebangs, lack of `#SBATCH` configurations, and crashes caused by non-existent log directory paths (with an option to automatically create them).
+*   **Pre-Flight Script Linter**: Scans scripts before submission. Warns about missing shebangs, lack of `#SBATCH` configurations, and crashes caused by non-existent log directory paths (with an option to automatically create them). Bypasses directory existence checks when overriding/redirecting logs.
 *   **Smart Date-Based Logging**: Automatically creates chronological directories (`./logs/YYMMDD/`) and assigns `--output` and `--error` parameters to keep workspaces clean if they are not defined in the script or CLI.
+*   **Log Redirection & Overrides (`-ol`, `--override-logs` / `-l`, `--log-dir=DIR`)**: Redirects stdout and stderr to a customized log directory or default date-based directory, preserving the original basenames of output/error files specified in CLI/script configurations or using defaults.
 *   **Dual-Stream Log Tailing (`-t` / `--track`)**: Submits your job, displays real-time queuing diagnostics, automatically localizes **both** stdout and stderr log files, streams them concurrently directly to your screen (using `tail -f`), and exits cleanly when the job terminates.
 
 ### 4. `slogs` (Smart Log Streamer) — *Wraps `tail -f`*
@@ -101,6 +103,23 @@ spriority --mock
 ---
 
 ## 📖 Sample Usage & Workflows
+
+### Free GPU Resource Auditing
+Query available GPU, CPU, and memory resources on active nodes with free GPUs in the cluster:
+```bash
+scluster --free
+# Or check a specific partition:
+scluster --free=compute
+```
+**Interactive breakdown grid:**
+```
+FREE GPU RESOURCES BREAKDOWN (Partition: gpu)
+NODE            FREE GPUS          FREE CPUS          FREE MEMORY       
+gnode01         ⚡ 2 free          🖥️ 8 free          💾 ~64GB free     
+gnode02         ⚡ 4 free          🖥️ 16 free         💾 ~128GB free    
+----------------------------------------------------------------------
+TOTAL FREE      ⚡ 6 free          🖥️ 24 free         💾 ~192GB free    
+```
 
 ### Dynamic Job Submission with Dual Log Tracking
 Submit an interactive job and track stdout and stderr outputs concurrently in real-time:

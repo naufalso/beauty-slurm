@@ -24,6 +24,8 @@ ${STYLE_BOLD}Usage:${STYLE_RESET} sbatch-track [options] [sbatch-options] <scrip
 
 ${STYLE_BOLD}Options:${STYLE_RESET}
   -t, --track      Automatically wait for the job to start and stream its log file
+  -ol, --override-logs  Override output and error logs to date-based dir: ./logs/YYMMDD/{filename}
+  -l, --log-dir=DIR Override log directory to DIR and override output/error logs
   --color=VAL      Force color modes: auto (default), always, never
   --mock           Force local mocking layer (for offline testing)
   -h, --help       Show this help message
@@ -47,8 +49,10 @@ done
 # Parse global flags
 parse_global_flags "$@"
 
-# Extract tracking option and script file
+# Extract tracking option, override options, and script file
 TRACK_MODE=0
+OVERRIDE_LOGS=0
+LOG_DIR_VAL=""
 SBATCH_ARGS=()
 script_file=""
 
@@ -56,6 +60,20 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--track)
             TRACK_MODE=1
+            shift
+            ;;
+        -ol|--override-logs)
+            OVERRIDE_LOGS=1
+            shift
+            ;;
+        -l|--log-dir)
+            OVERRIDE_LOGS=1
+            LOG_DIR_VAL="$2"
+            shift 2
+            ;;
+        --log-dir=*)
+            OVERRIDE_LOGS=1
+            LOG_DIR_VAL="${1#*=}"
             shift
             ;;
         --color=*|--mock)
@@ -74,56 +92,128 @@ done
 
 if [ -z "$script_file" ]; then
     error "No submission script specified."
-    echo "Usage: sbatch-track [-t] <script.sh>"
+    echo "Usage: sbatch-track [-t] [-ol] [-l <dir>] <script.sh>"
     exit 1
 fi
 
 # Check if output or error paths are defined in CLI or script directives
 has_output=0
 has_error=0
-
-# Check command line arguments
-for ((i=0; i<${#SBATCH_ARGS[@]}; i++)); do
-    arg="${SBATCH_ARGS[i]}"
-    if [[ "$arg" == "-o" || "$arg" == "--output" ]]; then
-        has_output=1
-    elif [[ "$arg" == --output=* ]]; then
-        has_output=1
-    elif [[ "$arg" == "-e" || "$arg" == "--error" ]]; then
-        has_error=1
-    elif [[ "$arg" == --error=* ]]; then
-        has_error=1
-    fi
-done
+cli_output=""
+cli_error=""
+script_output=""
+script_error=""
 
 # Check script directives
 if [ -f "$script_file" ]; then
     if grep -E -q "^#SBATCH[[:space:]]+(-o|--output)" "$script_file"; then
         has_output=1
+        output_line=$(grep -E "^#SBATCH[[:space:]]+(-o|--output)" "$script_file" | tail -n 1)
+        script_output=$(echo "$output_line" | sed -E 's/^#SBATCH[[:space:]]+(-o|--output)[[:space:]]*=?//' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' | tr -d '"' | tr -d "'")
     fi
     if grep -E -q "^#SBATCH[[:space:]]+(-e|--error)" "$script_file"; then
         has_error=1
+        error_line=$(grep -E "^#SBATCH[[:space:]]+(-e|--error)" "$script_file" | tail -n 1)
+        script_error=$(echo "$error_line" | sed -E 's/^#SBATCH[[:space:]]+(-e|--error)[[:space:]]*=?//' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' | tr -d '"' | tr -d "'")
     fi
 fi
 
-# Apply defaults if not specified
-if [ "$has_output" -eq 0 ] || [ "$has_error" -eq 0 ]; then
-    date_dir=$(date +%y%m%d)
-    log_dir="./logs/${date_dir}"
-    
+# Extract and filter command line arguments to accurately set has_output/has_error and original formats
+NEW_SBATCH_ARGS=()
+i=0
+while [[ $i -lt ${#SBATCH_ARGS[@]} ]]; do
+    arg="${SBATCH_ARGS[i]}"
+    if [[ "$arg" == "--output" ]]; then
+        cli_output="${SBATCH_ARGS[i+1]}"
+        has_output=1
+        i=$((i+2))
+    elif [[ "$arg" == --output=* ]]; then
+        cli_output="${arg#*=}"
+        has_output=1
+        i=$((i+1))
+    elif [[ "$arg" == "-o" ]]; then
+        cli_output="${SBATCH_ARGS[i+1]}"
+        has_output=1
+        i=$((i+2))
+    elif [[ "$arg" == "--error" ]]; then
+        cli_error="${SBATCH_ARGS[i+1]}"
+        has_output=1
+        i=$((i+2))
+    elif [[ "$arg" == --error=* ]]; then
+        cli_error="${arg#*=}"
+        has_output=1
+        i=$((i+1))
+    elif [[ "$arg" == "-e" ]]; then
+        cli_error="${SBATCH_ARGS[i+1]}"
+        has_output=1
+        i=$((i+2))
+    else
+        NEW_SBATCH_ARGS+=("$arg")
+        i=$((i+1))
+    fi
+done
+
+# Apply override or assign defaults
+if [ "${OVERRIDE_LOGS:-0}" -eq 1 ]; then
+    # Determine the original formats
+    orig_output=""
+    if [ -n "$cli_output" ]; then
+        orig_output="$cli_output"
+    elif [ -n "$script_output" ]; then
+        orig_output="$script_output"
+    else
+        orig_output="%x-%j.out"
+    fi
+
+    orig_error=""
+    if [ -n "$cli_error" ]; then
+        orig_error="$cli_error"
+    elif [ -n "$script_error" ]; then
+        orig_error="$script_error"
+    else
+        orig_error="%x-%j.err"
+    fi
+
+    orig_output_filename=$(basename "$orig_output")
+    orig_error_filename=$(basename "$orig_error")
+
+    if [ -n "$LOG_DIR_VAL" ]; then
+        log_dir="$LOG_DIR_VAL"
+    else
+        date_dir=$(date +%y%m%d)
+        log_dir="./logs/${date_dir}"
+    fi
+
     if [ ! -d "$log_dir" ]; then
-        info "Creating default date-based log directory: $log_dir"
+        info "Creating override log directory: $log_dir"
         mkdir -p "$log_dir"
     fi
-    
-    if [ "$has_output" -eq 0 ]; then
-        SBATCH_ARGS+=("--output=${log_dir}/%x-%j.out")
-        info "Auto-assigned default stdout: ${CLR_CYAN}${log_dir}/%x-%j.out${STYLE_RESET}"
-    fi
-    
-    if [ "$has_error" -eq 0 ]; then
-        SBATCH_ARGS+=("--error=${log_dir}/%x-%j.err")
-        info "Auto-assigned default stderr: ${CLR_CYAN}${log_dir}/%x-%j.err${STYLE_RESET}"
+
+    SBATCH_ARGS=("${NEW_SBATCH_ARGS[@]}")
+    SBATCH_ARGS+=("--output=${log_dir}/${orig_output_filename}")
+    SBATCH_ARGS+=("--error=${log_dir}/${orig_error_filename}")
+    info "Overrode stdout to: ${CLR_CYAN}${log_dir}/${orig_output_filename}${STYLE_RESET}"
+    info "Overrode stderr to: ${CLR_CYAN}${log_dir}/${orig_error_filename}${STYLE_RESET}"
+else
+    # Maintain original behavior: apply defaults if not specified
+    if [ "$has_output" -eq 0 ] || [ "$has_error" -eq 0 ]; then
+        date_dir=$(date +%y%m%d)
+        log_dir="./logs/${date_dir}"
+        
+        if [ ! -d "$log_dir" ]; then
+            info "Creating default date-based log directory: $log_dir"
+            mkdir -p "$log_dir"
+        fi
+        
+        if [ "$has_output" -eq 0 ]; then
+            SBATCH_ARGS+=("--output=${log_dir}/%x-%j.out")
+            info "Auto-assigned default stdout: ${CLR_CYAN}${log_dir}/%x-%j.out${STYLE_RESET}"
+        fi
+        
+        if [ "$has_error" -eq 0 ]; then
+            SBATCH_ARGS+=("--error=${log_dir}/%x-%j.err")
+            info "Auto-assigned default stderr: ${CLR_CYAN}${log_dir}/%x-%j.err${STYLE_RESET}"
+        fi
     fi
 fi
 
@@ -151,24 +241,27 @@ lint_script() {
 
     # Check for invalid output directory
     # Common crash: #SBATCH -o logs/slurm-%j.out but the folder logs/ does not exist.
-    local output_directive
-    output_directive=$(grep -E "^#SBATCH[[:space:]]+(-o|--output)=" "$script" || grep -E "^#SBATCH[[:space:]]+(-o|--output)[[:space:]]+" "$script")
-    if [ -n "$output_directive" ]; then
-        local log_val
-        log_val=$(echo "$output_directive" | sed -E 's/^#SBATCH[[:space:]]+(-o|--output)=?//' | tr -d '"' | tr -d "'")
-        
-        # Resolve folder name
-        local log_dir
-        log_dir=$(dirname "$log_val")
-        if [[ "$log_dir" != "." && "$log_dir" != "/" && ! -d "$log_dir" && "$log_val" != "/dev/null" ]]; then
-            warn "Target log folder '$log_dir' does not exist. The job will crash immediately unless created."
+    # We bypass this check if OVERRIDE_LOGS is active, since output logs will be redirected.
+    if [ "${OVERRIDE_LOGS:-0}" -eq 0 ]; then
+        local output_directive
+        output_directive=$(grep -E "^#SBATCH[[:space:]]+(-o|--output)=" "$script" || grep -E "^#SBATCH[[:space:]]+(-o|--output)[[:space:]]+" "$script")
+        if [ -n "$output_directive" ]; then
+            local log_val
+            log_val=$(echo "$output_directive" | sed -E 's/^#SBATCH[[:space:]]+(-o|--output)=?//' | tr -d '"' | tr -d "'")
             
-            # Interactive folder creation
-            if [ -t 0 ]; then
-                read -p "Would you like me to create this folder now? [Y/n] " -n 1 -r
-                echo ""
-                if [[ $REPLY =~ ^[Yy]$ || -z $REPLY ]]; then
-                    mkdir -p "$log_dir" && success "Folder '$log_dir' created successfully!"
+            # Resolve folder name
+            local log_dir
+            log_dir=$(dirname "$log_val")
+            if [[ "$log_dir" != "." && "$log_dir" != "/" && ! -d "$log_dir" && "$log_val" != "/dev/null" ]]; then
+                warn "Target log folder '$log_dir' does not exist. The job will crash immediately unless created."
+                
+                # Interactive folder creation
+                if [ -t 0 ]; then
+                    read -p "Would you like me to create this folder now? [Y/n] " -n 1 -r
+                    echo ""
+                    if [[ $REPLY =~ ^[Yy]$ || -z $REPLY ]]; then
+                        mkdir -p "$log_dir" && success "Folder '$log_dir' created successfully!"
+                    fi
                 fi
             fi
         fi

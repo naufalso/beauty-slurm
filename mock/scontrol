@@ -6,6 +6,49 @@
 MOCK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$MOCK_DIR/cluster_state.sh"
 
+get_total_gpu() {
+    local gres="$1"
+    if [[ "$gres" =~ gpu:[^:]+:([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$gres" =~ gpu:([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "0"
+    fi
+}
+
+get_alloc_gpu() {
+    local node_name="$1"
+    local total_alloc=0
+    # Combine static jobs and dynamic jobs
+    local ALL_JOBS=("${MOCK_JOBS[@]}")
+    if [ -f "$MOCK_DIR/.jobs_state" ]; then
+        local line
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                ALL_JOBS+=("$line")
+            fi
+        done < "$MOCK_DIR/.jobs_state"
+    fi
+
+    local job_str
+    for job_str in "${ALL_JOBS[@]}"; do
+        local j_id j_part j_name j_user j_state j_time j_limit j_ncount j_nlist j_cpus j_mem j_gres j_reason j_stdout j_stderr
+        IFS='|' read -r j_id j_part j_name j_user j_state j_time j_limit j_ncount j_nlist j_cpus j_mem j_gres j_reason j_stdout j_stderr <<< "$job_str"
+        if [ "$j_state" == "RUNNING" ]; then
+            if [[ "$j_nlist" == *"$node_name"* ]]; then
+                if [[ "$j_gres" =~ gpu:[^:]+:([0-9]+) ]]; then
+                    total_alloc=$((total_alloc + BASH_REMATCH[1]))
+                elif [[ "$j_gres" =~ gpu:([0-9]+) ]]; then
+                    total_alloc=$((total_alloc + BASH_REMATCH[1]))
+                fi
+            fi
+        fi
+    done
+    echo "$total_alloc"
+}
+
+
 action="$1"
 target_type="$2"
 target_id="$3"
@@ -68,21 +111,57 @@ EOF
         exit 1
     fi
 
-elif [ "$target_type" == "node" ]; then
-    # Find node
-    node_found=0
-    for node_str in "${MOCK_NODES[@]}"; do
-        IFS='|' read -r n_name n_state n_cpus n_mem n_gres n_reason <<< "$node_str"
-        if [ "$n_name" == "$target_id" ]; then
-            node_found=1
+elif [[ "$target_type" == "node" || "$target_type" == "nodes" ]]; then
+    # If target_id is empty or "-o", print all nodes in single-line format
+    if [[ -z "$target_id" || "$target_id" == "-o" ]]; then
+        for node_str in "${MOCK_NODES[@]}"; do
+            IFS='|' read -r n_name n_state n_cpus n_mem n_gres n_reason <<< "$node_str"
             
-            # Split allocated vs total CPUs/Mem
+            # Determine partition name based on prefix
+            n_part="unknown"
+            if [[ "$n_name" == gnode* ]]; then
+                n_part="gpu"
+            elif [[ "$n_name" == memnode* ]]; then
+                n_part="highmem"
+            elif [[ "$n_name" == node* ]]; then
+                n_part="compute"
+            fi
+            
             alloc_cpus=$(echo "$n_cpus" | cut -d/ -f1)
             total_cpus=$(echo "$n_cpus" | cut -d/ -f2)
             alloc_mem=$(echo "$n_mem" | cut -d/ -f1)
             total_mem=$(echo "$n_mem" | cut -d/ -f2)
             
-            cat <<EOF
+            total_gpus=$(get_total_gpu "$n_gres")
+            alloc_gpus=$(get_alloc_gpu "$n_name")
+            
+            cfg_tres="cpu=${total_cpus},mem=${total_mem}M"
+            if [ "$total_gpus" -gt 0 ]; then
+                cfg_tres="${cfg_tres},gres/gpu=${total_gpus}"
+            fi
+
+            alloc_tres="cpu=${alloc_cpus},mem=${alloc_mem}M"
+            if [ "$total_gpus" -gt 0 ]; then
+                alloc_tres="${alloc_tres},gres/gpu=${alloc_gpus}"
+            fi
+            
+            echo "NodeName=$n_name Partitions=$n_part Gres=$n_gres CfgTRES=$cfg_tres AllocTRES=$alloc_tres State=$n_state"
+        done
+    else
+        # Find node
+        node_found=0
+        for node_str in "${MOCK_NODES[@]}"; do
+            IFS='|' read -r n_name n_state n_cpus n_mem n_gres n_reason <<< "$node_str"
+            if [ "$n_name" == "$target_id" ]; then
+                node_found=1
+                
+                # Split allocated vs total CPUs/Mem
+                alloc_cpus=$(echo "$n_cpus" | cut -d/ -f1)
+                total_cpus=$(echo "$n_cpus" | cut -d/ -f2)
+                alloc_mem=$(echo "$n_mem" | cut -d/ -f1)
+                total_mem=$(echo "$n_mem" | cut -d/ -f2)
+                
+                cat <<EOF
 NodeName=$n_name Arch=x86_64 CoresPerSocket=12
    CPUAlloc=$alloc_cpus CPUTot=$total_cpus CPULoad=1.24
    AvailableFeatures=(null)
@@ -93,18 +172,17 @@ NodeName=$n_name Arch=x86_64 CoresPerSocket=12
    OS=Linux 5.4.0-74-generic #83-Ubuntu SMP
    RealMemory=$total_mem AllocMem=$alloc_mem FreeMem=$((total_mem - alloc_mem)) Sockets=2 Boards=1
    State=$n_state ThreadsPerCore=2 TmpDisk=0 Weight=1 Owner=N/A MCS_label=N/A
-   BootTime=2026-05-19T08:00:00 SlurmdStartTime=2026-05-19T08:02:00
-   LastBusyTime=2026-05-20T15:00:00
 EOF
-            if [ -n "$n_reason" ]; then
-                echo "   Reason=$n_reason [slurm@2026-05-20T10:00:00]"
+                if [ -n "$n_reason" ]; then
+                    echo "   Reason=$n_reason [slurm@2026-05-20T10:00:00]"
+                fi
+                break
             fi
-            break
+        done
+        if [ "$node_found" -eq 0 ]; then
+            echo "slurm_load_node error: Description of node not found" >&2
+            exit 1
         fi
-    done
-    if [ "$node_found" -eq 0 ]; then
-        echo "slurm_load_node error: Description of node not found" >&2
-        exit 1
     fi
 else
     echo "Mock scontrol: Unsupported target type '$target_type'" >&2
